@@ -8,6 +8,9 @@ package me.seedexplorer.addon.gui;
 import me.seedexplorer.addon.map.BiomeGenerator;
 import me.seedexplorer.addon.map.ChunkTile;
 import me.seedexplorer.addon.map.MinimapManager;
+import me.seedexplorer.addon.modules.SeedExplorerModule;
+import me.seedexplorer.addon.ore.OreCache;
+import me.seedexplorer.addon.ore.OrePatch;
 import me.seedexplorer.addon.structures.GeneratedStructure;
 import me.seedexplorer.addon.structures.StructureCache;
 import me.seedexplorer.addon.structures.StructurePredictor;
@@ -20,6 +23,7 @@ import meteordevelopment.meteorclient.gui.WidgetScreen;
 import meteordevelopment.meteorclient.gui.renderer.GuiRenderer;
 import meteordevelopment.meteorclient.gui.widgets.input.WTextBox;
 import meteordevelopment.meteorclient.renderer.Renderer2D;
+import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.meteorclient.utils.player.ChatUtils;
 import meteordevelopment.meteorclient.utils.render.color.Color;
 import net.minecraft.client.Minecraft;
@@ -59,6 +63,9 @@ public class SeedExplorerScreen extends WidgetScreen {
     private List<SeedWaypoint> visibleWaypoints = new ArrayList<>();
     private SeedWaypoint hoveredWaypoint;
     private SeedWaypoint selectedWaypoint;
+
+    // Ore data
+    private List<OrePatch> visibleOres = new ArrayList<>();
 
     // Context menu
     private boolean contextMenuOpen;
@@ -166,9 +173,13 @@ public class SeedExplorerScreen extends WidgetScreen {
         // Update visible structures based on current viewport
         updateVisibleStructures();
         updateVisibleWaypoints();
+        updateVisibleOres();
 
         // Render structure icons
         renderStructures(mouseX, mouseY);
+
+        // Render ore overlay
+        renderOres(mouseX, mouseY);
 
         // Render seed waypoint markers
         renderWaypoints(mouseX, mouseY);
@@ -353,6 +364,61 @@ public class SeedExplorerScreen extends WidgetScreen {
                 hoveredStructure = gs;
             }
         }
+    }
+
+    private void updateVisibleOres() {
+        SeedExplorerModule module = Modules.get().get(SeedExplorerModule.class);
+        if (module == null || !module.oreOverlay.get()) {
+            visibleOres.clear();
+            return;
+        }
+
+        Minecraft mc = Minecraft.getInstance();
+        double screenWidth = mc.getWindow().getGuiScaledWidth();
+        double screenHeight = mc.getWindow().getGuiScaledHeight();
+
+        int startX = (int) Math.floor((offsetX - (screenWidth / 2 / zoom)) / 16);
+        int startZ = (int) Math.floor((offsetZ - (screenHeight / 2 / zoom)) / 16);
+        int endX = (int) Math.ceil((offsetX + (screenWidth / 2 / zoom)) / 16);
+        int endZ = (int) Math.ceil((offsetZ + (screenHeight / 2 / zoom)) / 16);
+
+        // Add a margin of 10 chunks to pre-cache neighboring regions
+        int margin = 10;
+        visibleOres = OreCache.get().getOres(
+            startX - margin, startZ - margin,
+            endX + margin, endZ + margin,
+            selectedDimension
+        );
+    }
+
+    private void renderOres(int mouseX, int mouseY) {
+        SeedExplorerModule module = Modules.get().get(SeedExplorerModule.class);
+        if (module == null || !module.oreOverlay.get() || visibleOres.isEmpty()) return;
+
+        Minecraft mc = Minecraft.getInstance();
+        double screenWidth = mc.getWindow().getGuiScaledWidth();
+        double screenHeight = mc.getWindow().getGuiScaledHeight();
+
+        Renderer2D r = Renderer2D.COLOR;
+        r.begin();
+
+        for (OrePatch patch : visibleOres) {
+            double sx = (patch.x - offsetX) * zoom + screenWidth / 2;
+            double sy = (patch.z - offsetZ) * zoom + screenHeight / 2;
+
+            // Skip if outside visible area
+            if (sx < -20 || sx > screenWidth + 20 || sy < -20 || sy > screenHeight + 20) continue;
+
+            Color color = patch.type.color;
+            double dotSize = Math.max(3, 6 * zoom);
+            dotSize = Math.min(dotSize, 12);
+
+            double half = dotSize / 2;
+            r.quad(sx - half, sy - half, dotSize, dotSize, color);
+        }
+
+        r.render();
+        r.end();
     }
 
     private void renderWaypoints(int mouseX, int mouseY) {
@@ -877,6 +943,7 @@ public class SeedExplorerScreen extends WidgetScreen {
                         if (selectedDimension != dimValues[i]) {
                             selectedDimension = dimValues[i];
                             StructureCache.get().clear();
+                            OreCache.get().clear();
                         }
                         return true;
                     }
