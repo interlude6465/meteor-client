@@ -7,6 +7,7 @@ package me.seedexplorer.addon;
 
 import me.seedexplorer.addon.commands.SeedCommand;
 import me.seedexplorer.addon.commands.SeedExplorerCommand;
+import me.seedexplorer.addon.commands.WaypointCommand;
 import me.seedexplorer.addon.modules.SeedExplorerModule;
 import me.seedexplorer.addon.seed.SeedManager;
 import meteordevelopment.meteorclient.addons.GithubRepo;
@@ -33,6 +34,7 @@ public class SeedExplorerAddon extends MeteorAddon {
         // Register commands
         Commands.add(new SeedExplorerCommand());
         Commands.add(new SeedCommand());
+        Commands.add(new WaypointCommand());
     }
 
     @Override

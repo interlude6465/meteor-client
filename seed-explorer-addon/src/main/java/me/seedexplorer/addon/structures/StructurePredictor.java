@@ -61,7 +61,7 @@ public class StructurePredictor {
                                         long seed, int rMinX, int rMinZ, int rMaxX, int rMaxZ) {
         for (int rz = rMinZ; rz <= rMaxZ; rz++) {
             for (int rx = rMinX; rx <= rMaxX; rx++) {
-                GeneratedStructure gs = predictInRegion(type, seed, rx, rz);
+                GeneratedStructure gs = predictInRegionRaw(type, seed, rx, rz);
                 if (gs != null) {
                     results.add(gs);
                 }
