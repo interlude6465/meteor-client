@@ -1,0 +1,96 @@
+plugins {
+    id("idea")
+    id("net.neoforged.moddev")
+    id("java-library")
+}
+
+val minecraftVersion: String by rootProject.extra
+val neoForgeVersion: String by rootProject.extra
+
+val fullVersion: String by rootProject.extra
+
+base {
+    archivesName = "voxelmap-neoforge"
+}
+
+sourceSets {
+
+}
+
+repositories {
+    mavenLocal()
+    maven("https://maven.su5ed.dev/releases")
+    maven("https://maven.neoforged.net/releases/")
+}
+
+val serviceJar: Jar by tasks.creating(Jar::class) {
+    from(rootDir.resolve("LICENSE.md"))
+    manifest.attributes["FMLModType"] = "LIBRARY"
+    archiveClassifier = "service"
+}
+
+configurations {
+    create("serviceConfig") {
+        isCanBeConsumed = true
+        isCanBeResolved = false
+        outgoing {
+            artifact(serviceJar)
+        }
+    }
+}
+
+dependencies {
+    jarJar(project(":neoforge", "serviceConfig"))
+}
+
+tasks.jar {
+    val commonMain = project.project(":common").sourceSets.getByName("main")
+    val serverCommonMain = project.project(":server-common").sourceSets.getByName("main")
+    from(commonMain.output.classesDirs) {
+        exclude("/voxelmap.refmap.json")
+    }
+    from(commonMain.output.resourcesDir)
+    from(serverCommonMain.output.classesDirs)
+    from(serverCommonMain.output.resourcesDir)
+
+    from(rootDir.resolve("LICENSE.md"))
+
+    filesMatching("neoforge.mods.toml") {
+        expand(mapOf("version" to fullVersion))
+    }
+}
+
+tasks.jar.get().destinationDirectory = rootDir.resolve("build").resolve("libs")
+
+neoForge {
+    // Specify the version of NeoForge to use.
+    version = neoForgeVersion
+
+    runs {
+        create("client") {
+            client()
+        }
+        create("server") {
+            server()
+        }
+    }
+
+    mods {
+        create("voxelmap") {
+            sourceSet(sourceSets.main.get())
+            sourceSet(project.project(":common").sourceSets.main.get())
+            sourceSet(project.project(":server-common").sourceSets.main.get())
+        }
+    }
+}
+
+tasks.named("compileTestJava").configure {
+    enabled = false
+}
+
+dependencies {
+    compileOnly(project.project(":common").sourceSets.main.get().output)
+    compileOnly(project.project(":server-common").sourceSets.main.get().output)
+}
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(25)
