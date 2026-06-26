@@ -1,0 +1,33 @@
+modLoader = "javafml"
+loaderVersion = "*"
+license = "All Rights Reserved"
+issueTrackerURL = "https://github.com/fantahund/Voxelmap/issues"
+
+[[mods]]
+modId = "voxelmap"
+version = "${version}"
+displayName = "VoxelMap"
+logoFile = "icon.png"
+authors = "Lahwran, Zaneris, MamiyaOtaru, fantahund, Brokkonaut, TheAlgorithm476, Algamja11"
+description = "Minimap and world map"
+displayURL = "https://github.com/fantahund/Voxelmap"
+
+[[dependencies.voxelmap]]
+modId = "neoforge"
+type = "required"
+versionRange = "[26.2.0.0-beta,)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.voxelmap]]
+modId = "minecraft"
+type = "required"
+versionRange = "[26.2,)"
+ordering = "NONE"
+side = "BOTH"
+
+[[mixins]]
+config = "mixin.voxelmap.json"
+
+[[mixins]]
+config = "mixin.voxelmap.neoforge.json"

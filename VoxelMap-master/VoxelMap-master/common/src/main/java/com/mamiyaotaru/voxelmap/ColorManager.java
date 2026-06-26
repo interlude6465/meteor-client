@@ -1,0 +1,1281 @@
+package com.mamiyaotaru.voxelmap;
+
+import com.google.common.collect.UnmodifiableIterator;
+import com.mamiyaotaru.voxelmap.interfaces.AbstractMapData;
+import com.mamiyaotaru.voxelmap.util.BlockModel;
+import com.mamiyaotaru.voxelmap.util.BlockRepository;
+import com.mamiyaotaru.voxelmap.util.ColorUtils;
+import com.mamiyaotaru.voxelmap.util.GLUtils;
+import com.mamiyaotaru.voxelmap.util.MessageUtils;
+import com.mamiyaotaru.voxelmap.util.MutableBlockPos;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.textures.FilterMode;
+import java.awt.Graphics;
+import java.awt.Image;
+import java.awt.image.BufferedImage;
+import java.awt.image.RasterFormatException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import javax.imageio.ImageIO;
+import net.minecraft.IdentifierException;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.color.block.BlockTintSource;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.block.BlockAndTintGetter;
+import net.minecraft.client.renderer.block.BlockStateModelSet;
+import net.minecraft.client.renderer.block.dispatch.BlockStateModelPart;
+import net.minecraft.client.renderer.texture.DynamicTexture;
+import net.minecraft.client.renderer.texture.MissingTextureAtlasSprite;
+import net.minecraft.client.renderer.texture.TextureAtlas;
+import net.minecraft.client.renderer.texture.TextureAtlasSprite;
+import net.minecraft.client.renderer.texture.TextureContents;
+import net.minecraft.client.resources.model.geometry.BakedQuad;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.data.AtlasIds;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.packs.resources.Resource;
+import net.minecraft.server.packs.resources.ResourceManager;
+import net.minecraft.util.ARGB;
+import net.minecraft.util.Mth;
+import net.minecraft.util.RandomSource;
+import net.minecraft.world.level.FoliageColor;
+import net.minecraft.world.level.GrassColor;
+import net.minecraft.world.level.biome.Biome;
+import net.minecraft.world.level.biome.Biomes;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.DoorBlock;
+import net.minecraft.world.level.block.LiquidBlock;
+import net.minecraft.world.level.block.RedStoneWireBlock;
+import net.minecraft.world.level.block.RenderShape;
+import net.minecraft.world.level.block.SignBlock;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.Property;
+import net.minecraft.world.level.chunk.ChunkAccess;
+import net.minecraft.world.level.chunk.LevelChunk;
+
+public class ColorManager {
+    private boolean resourcePacksChanged;
+    private ClientLevel world;
+    private BufferedImage terrainBuff;
+    private final Identifier hueColorWheel = Identifier.fromNamespaceAndPath(VoxelConstants.MOD_ID, "images/color_picker/color_wheel_hue.png");
+    private final Identifier hueSatColorWheel = Identifier.fromNamespaceAndPath(VoxelConstants.MOD_ID, "images/color_picker/color_wheel_hue_sat.png");
+    private int sizeOfBiomeArray;
+    private int[] blockColors = new int[16384];
+    private int[] blockColorsWithDefaultTint = new int[16384];
+    private final HashSet<Integer> biomeTintsAvailable = new HashSet<>();
+    private final boolean useConnectedTextures;
+    private final HashMap<Integer, int[][]> blockTintTables = new HashMap<>();
+    private final HashSet<Integer> biomeTextureAvailable = new HashSet<>();
+    private final HashMap<String, Integer> blockBiomeSpecificColors = new HashMap<>();
+    private float failedToLoadX;
+    private float failedToLoadY;
+    private String renderPassThreeBlendMode;
+    private final RandomSource random = RandomSource.create();
+    private boolean loaded;
+    private boolean loadedTerrainImage;
+    private final MutableBlockPos dummyBlockPos = new MutableBlockPos(BlockPos.ZERO.getX(), BlockPos.ZERO.getY(), BlockPos.ZERO.getZ());
+    private final ColorResolver spruceColorResolver = (blockState, biome, blockPos) -> FoliageColor.FOLIAGE_EVERGREEN;
+    private final ColorResolver birchColorResolver = (blockState, biome, blockPos) -> FoliageColor.FOLIAGE_BIRCH;
+    private final ColorResolver mangroveColorResolver = (blockState, biome, blockPos) -> FoliageColor.FOLIAGE_MANGROVE;
+    private final ColorResolver grassColorResolver = (blockState, biome, blockPos) -> biome.getGrassColor(blockPos.getX(), blockPos.getZ());
+    private final ColorResolver foliageColorResolver = (blockState, biome, blockPos) -> biome.getFoliageColor();
+    private final ColorResolver dryFoliageColorResolver = (blockState, biome, blockPos) -> biome.getDryFoliageColor();
+    private final ColorResolver waterColorResolver = (blockState, biome, blockPos) -> biome.getWaterColor();
+    private final ColorResolver redstoneColorResolver = (blockState, biome, blockPos) -> RedStoneWireBlock.getColorForPower(blockState.getValue(RedStoneWireBlock.POWER));
+
+    public ColorManager() {
+        this.useConnectedTextures = VoxelConstants.getModApiBridge().isModEnabled("optifine") || VoxelConstants.getModApiBridge().isModEnabled("continuity");
+
+        ++this.sizeOfBiomeArray;
+    }
+
+    public int getAirColor() {
+        return ARGB.toABGR(this.blockColors[BlockRepository.airID]);
+    }
+
+    public Identifier getHueColorWheel() {
+        return this.hueColorWheel;
+    }
+
+    public Identifier getHueSatColorWheel() {
+        return this.hueSatColorWheel;
+    }
+
+    public void onResourceManagerReload(ResourceManager resourceManager) {
+        this.resourcePacksChanged = true;
+    }
+
+    public BufferedImage getTerrainImage() {
+        return this.terrainBuff;
+    }
+
+    public boolean checkForChanges() {
+        boolean biomesChanged = false;
+
+        if (VoxelConstants.getClientWorld() != this.world) {
+            this.world = VoxelConstants.getClientWorld();
+            int largestBiomeID = 0;
+
+            for (Biome biome : this.world.registryAccess().lookupOrThrow(Registries.BIOME)) {
+                int biomeID = this.world.registryAccess().lookupOrThrow(Registries.BIOME).getId(biome);
+                if (biomeID > largestBiomeID) {
+                    largestBiomeID = biomeID;
+                }
+            }
+
+            if (this.sizeOfBiomeArray != largestBiomeID + 1) {
+                this.sizeOfBiomeArray = largestBiomeID + 1;
+                biomesChanged = true;
+            }
+        }
+
+        boolean changed = this.resourcePacksChanged || biomesChanged;
+        this.resourcePacksChanged = false;
+        if (changed) {
+            this.loadColors();
+        }
+
+        return changed;
+    }
+
+    private void loadColors() {
+        this.loadedTerrainImage = false;
+        VoxelConstants.getMinecraft().getSkinManager().get(VoxelConstants.getPlayer().getGameProfile());
+        BlockRepository.getBlocks();
+        this.loadColorPicker();
+        this.loadTexturePackTerrainImage();
+        TextureAtlasSprite missing = VoxelConstants.getMinecraft().getAtlasManager().getAtlasOrThrow(AtlasIds.BLOCKS).getSprite(Identifier.parse("missingno"));
+        this.failedToLoadX = missing.getU0();
+        this.failedToLoadY = missing.getV0();
+        this.loaded = false;
+
+        try {
+            Arrays.fill(this.blockColors, 0xFEFF00FF);
+            Arrays.fill(this.blockColorsWithDefaultTint, 0xFEFF00FF);
+            this.loadSpecialColors();
+            this.biomeTintsAvailable.clear();
+            this.biomeTextureAvailable.clear();
+            this.blockBiomeSpecificColors.clear();
+            this.blockTintTables.clear();
+            if (this.useConnectedTextures) {
+                try {
+                    this.processCTM();
+                } catch (Exception var4) {
+                    VoxelConstants.getLogger().error("error loading CTM " + var4.getLocalizedMessage(), var4);
+                }
+
+                try {
+                    this.processColorProperties();
+                } catch (Exception var3) {
+                    VoxelConstants.getLogger().error("error loading custom color properties " + var3.getLocalizedMessage(), var3);
+                }
+            }
+
+            VoxelConstants.getVoxelMapInstance().getMap().forceFullRender(true);
+        } catch (Exception var5) {
+            VoxelConstants.getLogger().error("error loading pack", var5);
+        }
+
+        this.loaded = true;
+    }
+
+    private void loadColorPicker() {
+        try {
+            DynamicTexture hueWheelTexture = new DynamicTexture(() -> "Hue Color Wheel", TextureContents.load(Minecraft.getInstance().getResourceManager(), this.hueColorWheel).image());
+            hueWheelTexture.sampler = RenderSystem.getSamplerCache().getClampToEdge(FilterMode.LINEAR);
+            VoxelConstants.getMinecraft().getTextureManager().register(this.hueColorWheel, hueWheelTexture);
+
+            DynamicTexture hueSatWheelTexture = new DynamicTexture(() -> "Hue Saturation Color Wheel", TextureContents.load(Minecraft.getInstance().getResourceManager(), this.hueSatColorWheel).image());
+            hueSatWheelTexture.sampler = RenderSystem.getSamplerCache().getClampToEdge(FilterMode.LINEAR);
+            VoxelConstants.getMinecraft().getTextureManager().register(this.hueSatColorWheel, hueSatWheelTexture);
+
+        } catch (Exception exception) {
+        }
+
+    }
+
+    public void setSkyColor(int skyColor) {
+        this.blockColors[BlockRepository.airID] = skyColor;
+        this.blockColors[BlockRepository.voidAirID] = skyColor;
+        this.blockColors[BlockRepository.caveAirID] = skyColor;
+    }
+
+    private void loadTexturePackTerrainImage() {
+        GLUtils.readTextureContentsToBufferedImage(VoxelConstants.getMinecraft().getTextureManager().getTexture(TextureAtlas.LOCATION_BLOCKS).getTexture(), image -> {
+            terrainBuff = image;
+            loadedTerrainImage = true;
+        });
+    }
+
+    private void loadSpecialColors() {
+        int blockStateID;
+        for (Iterator<BlockState> blockStateIterator = BlockRepository.pistonTechBlock.getStateDefinition().getPossibleStates().iterator(); blockStateIterator.hasNext(); this.blockColors[blockStateID] = 0) {
+            BlockState blockState = blockStateIterator.next();
+            blockStateID = BlockRepository.getStateId(blockState);
+        }
+
+        for (Iterator<BlockState> var6 = BlockRepository.barrier.getStateDefinition().getPossibleStates().iterator(); var6.hasNext(); this.blockColors[blockStateID] = 0) {
+            BlockState blockState = var6.next();
+            blockStateID = BlockRepository.getStateId(blockState);
+        }
+
+    }
+
+    public final int getBlockColorWithDefaultTint(MutableBlockPos blockPos, int blockStateID) {
+        if (this.loaded && loadedTerrainImage) {
+            int col = 0x1B000000;
+
+            try {
+                col = this.blockColorsWithDefaultTint[blockStateID];
+            } catch (ArrayIndexOutOfBoundsException ignored) {
+            }
+            return ARGB.toABGR(col != 0xFEFF00FF ? col : this.getBlockColor(blockPos, blockStateID));
+        } else {
+            return 0;
+        }
+    }
+
+    public final int getBlockColor(MutableBlockPos blockPos, int blockStateID, Biome biomeID) {
+        if (this.loaded && loadedTerrainImage) {
+            if (this.useConnectedTextures && this.biomeTextureAvailable.contains(blockStateID)) {
+                Integer col = this.blockBiomeSpecificColors.get(blockStateID + " " + biomeID);
+                if (col != null) {
+                    return ARGB.toABGR(col);
+                }
+            }
+
+            return ARGB.toABGR(this.getBlockColor(blockPos, blockStateID));
+        } else {
+            return 0;
+        }
+    }
+
+    private int getBlockColor(int blockStateID) {
+        return this.getBlockColor(this.dummyBlockPos, blockStateID);
+    }
+
+    private int getBlockColor(MutableBlockPos blockPos, int blockStateID) {
+        int col = 0x1B000000;
+
+        try {
+            col = this.blockColors[blockStateID];
+        } catch (ArrayIndexOutOfBoundsException var5) {
+            this.resizeColorArrays(blockStateID);
+        }
+
+        if (col == 0xFEFF00FF || col == 0x1B000000) {
+            BlockState blockState = BlockRepository.getStateById(blockStateID);
+            col = this.blockColors[blockStateID] = this.getColor(blockPos, blockState);
+        }
+
+        return col;
+    }
+
+    private int getBlockTint(BlockState state, int layer) {
+        BlockTintSource tintSource = VoxelConstants.getMinecraft().getBlockColors().getTintSource(state, layer);
+        if (tintSource == null) {
+            return 0xFFFFFFFF;
+        }
+
+        return tintSource.color(state);
+    }
+
+    private int getBlockTint(BlockState state, BlockAndTintGetter world, BlockPos pos, int layer) {
+        BlockTintSource tintSource = VoxelConstants.getMinecraft().getBlockColors().getTintSource(state, layer);
+        if (tintSource == null) {
+            return 0xFFFFFFFF;
+        }
+
+        return tintSource.colorInWorld(state, world, pos);
+    }
+
+    private synchronized void resizeColorArrays(int queriedID) {
+        if (queriedID >= this.blockColors.length) {
+            int[] newBlockColors = new int[this.blockColors.length * 2];
+            int[] newBlockColorsWithDefaultTint = new int[this.blockColors.length * 2];
+            System.arraycopy(this.blockColors, 0, newBlockColors, 0, this.blockColors.length);
+            System.arraycopy(this.blockColorsWithDefaultTint, 0, newBlockColorsWithDefaultTint, 0, this.blockColorsWithDefaultTint.length);
+            Arrays.fill(newBlockColors, this.blockColors.length, newBlockColors.length, 0xFEFF00FF);
+            Arrays.fill(newBlockColorsWithDefaultTint, this.blockColorsWithDefaultTint.length, newBlockColorsWithDefaultTint.length, 0xFEFF00FF);
+            this.blockColors = newBlockColors;
+            this.blockColorsWithDefaultTint = newBlockColorsWithDefaultTint;
+        }
+
+    }
+
+    private int getColor(MutableBlockPos blockPos, BlockState state) {
+        try {
+            int color = this.getColorForBlockPosBlockStateAndFacing(blockPos, state, Direction.UP);
+            if (color == 0x1B000000) {
+                color = this.getColorForTerrainSprite(state);
+            }
+
+            Block block = state.getBlock();
+            if (block == BlockRepository.cobweb) {
+                color |= -16777216;
+            }
+
+            if (block == BlockRepository.redstone) {
+                color = ColorUtils.colorMultiplier(color, this.getBlockTint(state, 0) | 0xFF000000);
+            }
+
+            if (BlockRepository.biomeBlocks.contains(block)) {
+                this.applyDefaultBuiltInShading(state, color);
+            } else {
+                this.checkForBiomeTinting(blockPos, state, color);
+            }
+
+            if (BlockRepository.shapedBlocks.contains(block)) {
+                color = this.applyShape(block, color);
+            }
+
+            if ((color >> 24 & 0xFF) < 27) {
+                color |= 0x1B000000;
+            }
+            // VoxelConstants.getLogger().info("getColor " + state.toString() + " -> " + Integer.toHexString(color));
+            return color;
+        } catch (Exception var5) {
+            VoxelConstants.getLogger().error("failed getting color: " + state.getBlock().getName().getString(), var5);
+            return 0x1B000000;
+        }
+    }
+
+    private int getColorForBlockPosBlockStateAndFacing(BlockPos blockPos, BlockState blockState, Direction facing) {
+        int color = 0x1B000000;
+
+        try {
+            RenderShape blockRenderType = blockState.getRenderShape();
+            BlockStateModelSet blockModelSet = VoxelConstants.getMinecraft().getModelManager().getBlockStateModelSet();
+            if (blockRenderType == RenderShape.MODEL) {
+                List<BlockStateModelPart> allQuads =  new ArrayList<>();
+                blockModelSet.get(blockState).collectParts(this.random, allQuads);
+
+                List<BakedQuad> quads = new ArrayList<>();
+                for (BlockStateModelPart modelPart : allQuads) {
+                    quads.addAll(modelPart.getQuads(facing));
+                    quads.addAll(modelPart.getQuads(null));
+                }
+                BlockModel model = new BlockModel(quads, this.failedToLoadX, this.failedToLoadY);
+                if (model.numberOfFaces() > 0) {
+                    BufferedImage modelImage = model.getImage(this.terrainBuff);
+                    if (modelImage != null) {
+                        color = this.getColorForCoordinatesAndImage(new float[]{0.0F, 1.0F, 0.0F, 1.0F}, modelImage);
+                    } else {
+                        VoxelConstants.getLogger().warn(String.format("Block texture for block %s is missing!", blockState.typeHolder().getRegisteredName()));
+                    }
+                }
+            }
+        } catch (Exception var11) {
+            VoxelConstants.getLogger().error(var11.getMessage(), var11);
+        }
+
+        return color;
+    }
+
+    private int getColorForTerrainSprite(BlockState blockState) {
+        BlockStateModelSet blockModelSet = VoxelConstants.getMinecraft().getModelManager().getBlockStateModelSet();
+        TextureAtlasSprite icon = blockModelSet.getParticleMaterial(blockState).sprite();
+        if (icon == blockModelSet.missingModel().particleMaterial().sprite()) {
+            Block block = blockState.getBlock();
+            Block material = blockState.getBlock();
+            if (block instanceof LiquidBlock) {
+                if (material == Blocks.WATER) {
+                    icon = VoxelConstants.getMinecraft().getAtlasManager().getAtlasOrThrow(AtlasIds.BLOCKS).getSprite(Identifier.parse("minecraft:blocks/water_flow"));
+                } else if (material == Blocks.LAVA) {
+                    icon = VoxelConstants.getMinecraft().getAtlasManager().getAtlasOrThrow(AtlasIds.BLOCKS).getSprite(Identifier.parse("minecraft:blocks/lava_flow"));
+                }
+            } else if (material == Blocks.WATER) {
+                icon = VoxelConstants.getMinecraft().getAtlasManager().getAtlasOrThrow(AtlasIds.BLOCKS).getSprite(Identifier.parse("minecraft:blocks/water_still"));
+            } else if (material == Blocks.LAVA) {
+                icon = VoxelConstants.getMinecraft().getAtlasManager().getAtlasOrThrow(AtlasIds.BLOCKS).getSprite(Identifier.parse("minecraft:blocks/lava_still"));
+            }
+        }
+
+        return this.getColorForIcon(icon);
+    }
+
+    private int getColorForIcon(TextureAtlasSprite icon) {
+        int color = 0x1B000000;
+        if (icon != null) {
+            float left = icon.getU0();
+            float right = icon.getU1();
+            float top = icon.getV0();
+            float bottom = icon.getV1();
+            color = this.getColorForCoordinatesAndImage(new float[]{left, right, top, bottom}, this.terrainBuff);
+        }
+
+        return color;
+    }
+
+    private int getColorForCoordinatesAndImage(float[] uv, BufferedImage imageBuff) {
+        int color = 0x1B000000;
+        if (uv[0] != this.failedToLoadX || uv[2] != this.failedToLoadY) {
+            int left = (int) (uv[0] * imageBuff.getWidth());
+            int right = (int) Math.ceil(uv[1] * imageBuff.getWidth());
+            int top = (int) (uv[2] * imageBuff.getHeight());
+            int bottom = (int) Math.ceil(uv[3] * imageBuff.getHeight());
+
+            try {
+                BufferedImage blockTexture = imageBuff.getSubimage(left, top, right - left, bottom - top);
+                Image singlePixel = blockTexture.getScaledInstance(1, 1, 4);
+                BufferedImage singlePixelBuff = new BufferedImage(1, 1, imageBuff.getType());
+                Graphics gfx = singlePixelBuff.createGraphics();
+                gfx.drawImage(singlePixel, 0, 0, null);
+                gfx.dispose();
+                color = singlePixelBuff.getRGB(0, 0);
+            } catch (RasterFormatException var12) {
+                VoxelConstants.getLogger().warn("error getting color");
+                VoxelConstants.getLogger().warn(IntStream.of(left, right, top, bottom).mapToObj(String::valueOf).collect(Collectors.joining(" ")));
+            }
+        }
+
+        return color;
+    }
+
+    private void applyDefaultBuiltInShading(BlockState blockState, int color) {
+        Block block = blockState.getBlock();
+        int blockStateID = BlockRepository.getStateId(blockState);
+        if (block != BlockRepository.largeFern && block != BlockRepository.tallGrass && block != BlockRepository.reeds) {
+            if (block == BlockRepository.water) {
+                this.blockColorsWithDefaultTint[blockStateID] = ColorUtils.colorMultiplier(color, 0xFF3F76E4);
+            } else {
+                this.blockColorsWithDefaultTint[blockStateID] = ColorUtils.colorMultiplier(color, this.getBlockTint(blockState, 0) | 0xFF000000);
+            }
+        } else {
+            this.blockColorsWithDefaultTint[blockStateID] = ColorUtils.colorMultiplier(color, GrassColor.get(0.7, 0.8) | 0xFF000000);
+        }
+
+    }
+
+    private void checkForBiomeTinting(MutableBlockPos blockPos, BlockState blockState, int color) {
+        try {
+            Block block = blockState.getBlock();
+            String blockName = String.valueOf(BuiltInRegistries.BLOCK.getKey(block));
+            if (BlockRepository.biomeBlocks.contains(block) || !blockName.startsWith("minecraft:")) {
+                int tint;
+                MutableBlockPos tempBlockPos = new MutableBlockPos(0, 0, 0);
+                if (blockPos == this.dummyBlockPos) {
+                    tint = this.tintFromFakePlacedBlock(blockState, tempBlockPos, null); // Biome 4?
+                } else {
+                    ClientLevel clientWorld = VoxelConstants.getClientWorld();
+
+                    ChunkAccess chunk = clientWorld.getChunk(blockPos);
+                    if (chunk != null && !((LevelChunk) chunk).isEmpty() && clientWorld.hasChunk(blockPos.getX() >> 4, blockPos.getZ() >> 4)) {
+                        tint = this.getBlockTint(blockState, clientWorld, blockPos, 1) | 0xFF000000;
+                    } else {
+                        tint = this.tintFromFakePlacedBlock(blockState, tempBlockPos, null); // Biome 4?
+                    }
+                }
+
+                if (tint != 16777215 && tint != -1) {
+                    int blockStateID = BlockRepository.getStateId(blockState);
+                    this.biomeTintsAvailable.add(blockStateID);
+                    this.blockColorsWithDefaultTint[blockStateID] = ColorUtils.colorMultiplier(color, tint);
+                } else {
+                    this.blockColorsWithDefaultTint[BlockRepository.getStateId(blockState)] = 0x1B000000;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+    }
+
+    private int tintFromFakePlacedBlock(BlockState blockState, MutableBlockPos loopBlockPos, Biome biomeID) {
+        return -1;
+    }
+
+    public int getBiomeTint(AbstractMapData mapData, ClientLevel world, BlockState blockState, int blockStateID, MutableBlockPos blockPos, MutableBlockPos loopBlockPos, int startX, int startZ) {
+        ChunkAccess chunk = world.getChunk(blockPos);
+        boolean live = chunk != null && !((LevelChunk) chunk).isEmpty() && VoxelConstants.getPlayer().level().hasChunk(blockPos.getX() >> 4, blockPos.getZ() >> 4);
+        int tint = -2;
+        if (this.useConnectedTextures || !live && this.biomeTintsAvailable.contains(blockStateID)) {
+            try {
+                int[][] tints = this.blockTintTables.get(blockStateID);
+                if (tints != null) {
+                    int r = 0;
+                    int g = 0;
+                    int b = 0;
+
+                    for (int t = blockPos.getX() - 1; t <= blockPos.getX() + 1; ++t) {
+                        for (int s = blockPos.getZ() - 1; s <= blockPos.getZ() + 1; ++s) {
+                            Biome biome;
+                            if (live) {
+                                biome = world.getBiome(loopBlockPos.withXYZ(t, blockPos.getY(), s)).value();
+                            } else {
+                                int dataX = t - startX;
+                                int dataZ = s - startZ;
+                                dataX = Math.max(dataX, 0);
+                                dataX = Math.min(dataX, mapData.getWidth() - 1);
+                                dataZ = Math.max(dataZ, 0);
+                                dataZ = Math.min(dataZ, mapData.getHeight() - 1);
+                                biome = mapData.getBiome(dataX, dataZ);
+                            }
+
+                            if (biome == null) {
+                                biome = world.registryAccess().lookupOrThrow(Registries.BIOME).get(Biomes.PLAINS).get().value();
+                            }
+                            int biomeID = world.registryAccess().lookupOrThrow(Registries.BIOME).getId(biome);
+                            int biomeTint = tints[biomeID][loopBlockPos.y / 8];
+                            r += (biomeTint & 0xFF0000) >> 16;
+                            g += (biomeTint & 0xFF00) >> 8;
+                            b += biomeTint & 0xFF;
+                        }
+                    }
+
+                    tint = 0xFF000000 | (r / 9 & 0xFF) << 16 | (g / 9 & 0xFF) << 8 | b / 9 & 0xFF;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        if (tint == -2) {
+            tint = this.getBuiltInBiomeTint(mapData, world, blockState, blockStateID, blockPos, loopBlockPos, startX, startZ, live);
+        }
+
+        return ARGB.toABGR(tint);
+    }
+
+    private int getBuiltInBiomeTint(AbstractMapData mapData, ClientLevel world, BlockState blockState, int blockStateID, MutableBlockPos blockPos, MutableBlockPos loopBlockPos, int startX, int startZ, boolean live) {
+        int tint = -1;
+        Block block = blockState.getBlock();
+        if (BlockRepository.biomeBlocks.contains(block) || this.biomeTintsAvailable.contains(blockStateID)) {
+            if (live) {
+                try {
+                    DebugRenderState.blockX = blockPos.x;
+                    DebugRenderState.blockY = blockPos.y;
+                    DebugRenderState.blockZ = blockPos.z;
+                    tint = this.getBlockTint(blockState, world, blockPos, 0) | 0xFF000000;
+                } catch (Exception ignored) {
+                }
+            }
+
+            if (tint == -1) {
+                tint = this.getBuiltInBiomeTintFromUnloadedChunk(mapData, world, blockState, blockStateID, blockPos, loopBlockPos, startX, startZ) | 0xFF000000;
+            }
+        }
+
+        return tint;
+    }
+
+    private int getBuiltInBiomeTintFromUnloadedChunk(AbstractMapData mapData, ClientLevel world, BlockState blockState, int blockStateID, MutableBlockPos blockPos, MutableBlockPos loopBlockPos, int startX, int startZ) {
+        int tint = -1;
+        Block block = blockState.getBlock();
+        ColorResolver colorResolver = null;
+        if (block == BlockRepository.water) {
+            colorResolver = this.waterColorResolver;
+        } else if (block == BlockRepository.spruceLeaves) {
+            colorResolver = this.spruceColorResolver;
+        } else if (block == BlockRepository.birchLeaves) {
+            colorResolver = this.birchColorResolver;
+        } else if (block == BlockRepository.mangroveLeaves) {
+            colorResolver = this.mangroveColorResolver;
+        } else {
+            boolean isFoliage = block == BlockRepository.oakLeaves || block == BlockRepository.jungleLeaves || block == BlockRepository.acaciaLeaves || block == BlockRepository.darkOakLeaves || block == BlockRepository.vine;
+            boolean isDryFoliage = block == BlockRepository.leafLitter;
+            if (isFoliage) {
+                colorResolver = this.foliageColorResolver;
+            } else if (isDryFoliage) {
+                colorResolver = this.dryFoliageColorResolver;
+            } else if (block == BlockRepository.redstone) {
+                colorResolver = this.redstoneColorResolver;
+            } else if (BlockRepository.biomeBlocks.contains(block)) {
+                colorResolver = this.grassColorResolver;
+            }
+        }
+
+        if (colorResolver != null) {
+            int r = 0;
+            int g = 0;
+            int b = 0;
+
+            for (int t = blockPos.getX() - 1; t <= blockPos.getX() + 1; ++t) {
+                for (int s = blockPos.getZ() - 1; s <= blockPos.getZ() + 1; ++s) {
+                    int dataX = blockPos.getX() - startX;
+                    int dataZ = blockPos.getZ() - startZ;
+                    dataX = Math.max(dataX, 0);
+                    dataX = Math.min(dataX, mapData.getWidth() - 1);
+                    dataZ = Math.max(dataZ, 0);
+                    dataZ = Math.min(dataZ, mapData.getHeight() - 1);
+
+                    Biome biome = mapData.getBiome(dataX, dataZ);
+                    if (biome == null) {
+                        MessageUtils.printDebug("Null biome ID! " + " at " + t + "," + s);
+                        MessageUtils.printDebug("block: " + mapData.getBlockstate(dataX, dataZ) + ", height: " + mapData.getHeight(dataX, dataZ));
+                        MessageUtils.printDebug("Mapdata: " + mapData);
+                    }
+
+                    int biomeTint = biome == null ? 0 : colorResolver.getColorAtPos(blockState, biome, loopBlockPos.withXYZ(t, blockPos.getY(), s));
+                    r += (biomeTint & 0xFF0000) >> 16;
+                    g += (biomeTint & 0xFF00) >> 8;
+                    b += biomeTint & 0xFF;
+                }
+            }
+
+            tint = (r / 9 & 0xFF) << 16 | (g / 9 & 0xFF) << 8 | b / 9 & 0xFF;
+        } else if (this.biomeTintsAvailable.contains(blockStateID)) {
+            tint = this.getCustomBlockBiomeTintFromUnloadedChunk(mapData, world, blockState, blockPos, loopBlockPos, startX, startZ);
+        }
+
+        return tint;
+    }
+
+    private int getCustomBlockBiomeTintFromUnloadedChunk(AbstractMapData mapData, ClientLevel world, BlockState blockState, MutableBlockPos blockPos, MutableBlockPos loopBlockPos, int startX, int startZ) {
+        int tint;
+
+        try {
+            int dataX = blockPos.getX() - startX;
+            int dataZ = blockPos.getZ() - startZ;
+            dataX = Math.max(dataX, 0);
+            dataX = Math.min(dataX, mapData.getWidth() - 1);
+            dataZ = Math.max(dataZ, 0);
+            dataZ = Math.min(dataZ, mapData.getHeight() - 1);
+            Biome biome = mapData.getBiome(dataX, dataZ);
+            tint = this.tintFromFakePlacedBlock(blockState, loopBlockPos, biome);
+        } catch (Exception var12) {
+            tint = -1;
+        }
+
+        return tint;
+    }
+
+    private int applyShape(Block block, int color) {
+        int alpha = color >> 24 & 0xFF;
+        int red = color >> 16 & 0xFF;
+        int green = color >> 8 & 0xFF;
+        int blue = color & 0xFF;
+        if (block instanceof SignBlock) {
+            alpha = 31;
+        } else if (block instanceof DoorBlock) {
+            alpha = 47;
+        } else if (block == BlockRepository.ladder || block == BlockRepository.vine) {
+            alpha = 15;
+        }
+
+        return (alpha & 0xFF) << 24 | (red & 0xFF) << 16 | (green & 0xFF) << 8 | blue & 0xFF;
+    }
+
+    private void processCTM() {
+        this.renderPassThreeBlendMode = "alpha";
+        Properties properties = new Properties();
+        Identifier propertiesFile = Identifier.withDefaultNamespace("optifine/renderpass.properties");
+
+        try {
+            InputStream input = VoxelConstants.getMinecraft().getResourceManager().getResource(propertiesFile).get().open();
+            if (input != null) {
+                properties.load(input);
+                input.close();
+                this.renderPassThreeBlendMode = properties.getProperty("blend.3", "alpha");
+            }
+        } catch (IOException var9) {
+            this.renderPassThreeBlendMode = "alpha";
+        }
+
+        String namespace = "minecraft";
+
+        for (Identifier s : this.findResources(namespace, "/optifine/ctm", ".properties", true, false, true)) {
+            try {
+                this.loadCTM(s);
+            } catch (IllegalArgumentException ignored) {
+            }
+        }
+
+        for (int t = 0; t < this.blockColors.length; ++t) {
+            if (this.blockColors[t] != 0x1B000000 && this.blockColors[t] != 0xFEFF00FF) {
+                if ((this.blockColors[t] >> 24 & 0xFF) < 27) {
+                    this.blockColors[t] |= 0x1B000000;
+                }
+
+                this.checkForBiomeTinting(this.dummyBlockPos, BlockRepository.getStateById(t), this.blockColors[t]);
+            }
+        }
+
+    }
+
+    private void loadCTM(Identifier propertiesFile) {
+        if (propertiesFile != null) {
+            BlockStateModelSet blockModelSet = VoxelConstants.getMinecraft().getModelManager().getBlockStateModelSet();
+            Properties properties = new Properties();
+
+            try {
+                InputStream input = VoxelConstants.getMinecraft().getResourceManager().getResource(propertiesFile).get().open();
+                if (input != null) {
+                    properties.load(input);
+                    input.close();
+                }
+            } catch (IOException var39) {
+                return;
+            }
+
+            String filePath = propertiesFile.getPath();
+            String method = properties.getProperty("method", "").trim().toLowerCase();
+            String faces = properties.getProperty("faces", "").trim().toLowerCase();
+            String matchBlocks = properties.getProperty("matchBlocks", "").trim().toLowerCase();
+            String matchTiles = properties.getProperty("matchTiles", "").trim().toLowerCase();
+            String metadata = properties.getProperty("metadata", "").trim().toLowerCase();
+            String tiles = properties.getProperty("tiles", "").trim();
+            String biomes = properties.getProperty("biomes", "").trim().toLowerCase();
+            String renderPass = properties.getProperty("renderPass", "").trim().toLowerCase();
+            metadata = metadata.replaceAll("\\s+", ",");
+            Set<BlockState> blockStates = new HashSet<>(this.parseBlocksList(matchBlocks, metadata));
+            String directory = filePath.substring(0, filePath.lastIndexOf("/") + 1);
+            String[] tilesParsed = this.parseStringList(tiles);
+            String tilePath = directory + "0";
+            if (tilesParsed.length > 0) {
+                tilePath = tilesParsed[0].trim();
+            }
+
+            if (tilePath.startsWith("~")) {
+                tilePath = tilePath.replace("~", "optifine");
+            } else if (!tilePath.contains("/")) {
+                tilePath = directory + tilePath;
+            }
+
+            if (!tilePath.toLowerCase().endsWith(".png")) {
+                tilePath = tilePath + ".png";
+            }
+
+            String[] biomesArray = biomes.split(" ");
+            if (blockStates.isEmpty()) {
+                Block block;
+                Pattern pattern = Pattern.compile(".*/block_(.+).properties");
+                Matcher matcher = pattern.matcher(filePath);
+                if (matcher.find()) {
+                    block = this.getBlockFromName(matcher.group(1));
+                    if (block != null) {
+                        Set<BlockState> matching = this.parseBlockMetadata(block, metadata);
+                        if (matching.isEmpty()) {
+                            matching.addAll(block.getStateDefinition().getPossibleStates());
+                        }
+
+                        blockStates.addAll(matching);
+                    }
+                } else {
+                    if (matchTiles.isEmpty()) {
+                        matchTiles = filePath.substring(filePath.lastIndexOf('/') + 1, filePath.lastIndexOf(".properties"));
+                    }
+
+                    if (!matchTiles.contains(":")) {
+                        matchTiles = "minecraft:blocks/" + matchTiles;
+                    }
+
+                    Identifier matchID = Identifier.parse(matchTiles);
+                    TextureAtlasSprite compareIcon = VoxelConstants.getMinecraft().getAtlasManager().getAtlasOrThrow(AtlasIds.BLOCKS).getSprite(matchID);
+                    if (compareIcon.atlasLocation() != MissingTextureAtlasSprite.getLocation()) {
+                        ArrayList<BlockState> tmpList = new ArrayList<>();
+
+                        for (Block testBlock : BuiltInRegistries.BLOCK) {
+
+                            for (BlockState blockState : testBlock.getStateDefinition().getPossibleStates()) {
+                                try {
+                                    List<BlockStateModelPart> allQuads = new ArrayList<>();
+                                    blockModelSet.get(blockState).collectParts(this.random, allQuads);
+
+                                    List<BakedQuad> quads = new ArrayList<>();
+                                    for (BlockStateModelPart modelPart : allQuads) {
+                                        quads.addAll(modelPart.getQuads(Direction.UP));
+                                        quads.addAll(modelPart.getQuads(null));
+                                    }
+                                    BlockModel model = new BlockModel(quads, this.failedToLoadX, this.failedToLoadY);
+                                    if (model.numberOfFaces() > 0) {
+                                        ArrayList<BlockModel.BlockFace> blockFaces = model.getFaces();
+
+                                        for (int i = 0; i < blockFaces.size(); ++i) {
+                                            BlockModel.BlockFace face = model.getFaces().get(i);
+                                            float minU = face.getMinU();
+                                            float maxU = face.getMaxU();
+                                            float minV = face.getMinV();
+                                            float maxV = face.getMaxV();
+                                            if (this.similarEnough(minU, maxU, minV, maxV, compareIcon.getU0(), compareIcon.getU1(), compareIcon.getV0(), compareIcon.getV1())) {
+                                                tmpList.add(blockState);
+                                            }
+                                        }
+                                    }
+                                } catch (Exception ignored) {
+                                }
+                            }
+                        }
+
+                        blockStates.addAll(tmpList);
+                    }
+                }
+            }
+
+            if (!blockStates.isEmpty()) {
+                if (!method.equals("horizontal") && !method.startsWith("overlay") && (method.equals("sandstone") || method.equals("top") || faces.contains("top") || faces.contains("all") || faces.isEmpty())) {
+                    try {
+                        Identifier pngResource = Identifier.fromNamespaceAndPath(propertiesFile.getNamespace(), tilePath);
+                        InputStream is = VoxelConstants.getMinecraft().getResourceManager().getResource(pngResource).get().open();
+                        Image top = ImageIO.read(is);
+                        is.close();
+                        top = top.getScaledInstance(1, 1, 4);
+                        BufferedImage topBuff = new BufferedImage(top.getWidth(null), top.getHeight(null), 6);
+                        Graphics gfx = topBuff.createGraphics();
+                        gfx.drawImage(top, 0, 0, null);
+                        gfx.dispose();
+                        int topRGB = topBuff.getRGB(0, 0);
+                        if ((topRGB >> 24 & 0xFF) == 0) {
+                            return;
+                        }
+
+                        for (BlockState blockState : blockStates) {
+                            topRGB = topBuff.getRGB(0, 0);
+                            if (blockState.getBlock() == BlockRepository.cobweb) {
+                                topRGB |= 0xFF000000;
+                            }
+
+                            if (renderPass.equals("3")) {
+                                topRGB = this.processRenderPassThree(topRGB);
+                                int blockStateID = BlockRepository.getStateId(blockState);
+                                int baseRGB = this.blockColors[blockStateID];
+                                if (baseRGB != 0x1B000000 && baseRGB != 0xFEFF00FF) {
+                                    topRGB = ColorUtils.colorMultiplier(baseRGB, topRGB);
+                                }
+                            }
+
+                            if (BlockRepository.shapedBlocks.contains(blockState.getBlock())) {
+                                topRGB = this.applyShape(blockState.getBlock(), topRGB);
+                            }
+
+                            int blockStateID = BlockRepository.getStateId(blockState);
+                            if (!biomes.isEmpty()) {
+                                this.biomeTextureAvailable.add(blockStateID);
+
+                                for (String s : biomesArray) {
+                                    int biomeInt = this.parseBiomeName(s);
+                                    if (biomeInt != -1) {
+                                        this.blockBiomeSpecificColors.put(blockStateID + " " + biomeInt, topRGB);
+                                    }
+                                }
+                            } else {
+                                this.blockColors[blockStateID] = topRGB;
+                            }
+                        }
+                    } catch (IOException var40) {
+                        VoxelConstants.getLogger().error("error getting CTM block from " + propertiesFile.getPath() + ": " + filePath + " " + BuiltInRegistries.BLOCK.getKey(blockStates.iterator().next().getBlock()) + " " + tilePath, var40);
+                    }
+                }
+
+            }
+        }
+    }
+
+    private boolean similarEnough(float a, float b, float c, float d, float one, float two, float three, float four) {
+        boolean similar = Math.abs(a - one) < 1.0E-4;
+        similar = similar && Math.abs(b - two) < 1.0E-4;
+        similar = similar && Math.abs(c - three) < 1.0E-4;
+        return similar && Math.abs(d - four) < 1.0E-4;
+    }
+
+    private int processRenderPassThree(int rgb) {
+        if (this.renderPassThreeBlendMode.equals("color") || this.renderPassThreeBlendMode.equals("overlay")) {
+            int red = rgb >> 16 & 0xFF;
+            int green = rgb >> 8 & 0xFF;
+            int blue = rgb & 0xFF;
+            float colorAverage = (red + blue + green) / 3.0F;
+            float lighteningFactor = (colorAverage - 127.5F) * 2.0F;
+            red += (int) (red * (lighteningFactor / 255.0F));
+            blue += (int) (red * (lighteningFactor / 255.0F));
+            green += (int) (red * (lighteningFactor / 255.0F));
+            int newAlpha = (int) Math.abs(lighteningFactor);
+            rgb = newAlpha << 24 | (red & 0xFF) << 16 | (green & 0xFF) << 8 | blue & 0xFF;
+        }
+
+        return rgb;
+    }
+
+    private String[] parseStringList(String list) {
+        ArrayList<String> tmpList = new ArrayList<>();
+
+        for (String token : list.split("\\s+")) {
+            token = token.trim();
+
+            try {
+                if (token.matches("^\\d+$")) {
+                    tmpList.add(String.valueOf(Integer.parseInt(token)));
+                } else if (token.matches("^\\d+-\\d+$")) {
+                    String[] t = token.split("-");
+                    int min = Integer.parseInt(t[0]);
+                    int max = Integer.parseInt(t[1]);
+
+                    for (int i = min; i <= max; ++i) {
+                        tmpList.add(String.valueOf(i));
+                    }
+                } else if (!token.isEmpty()) {
+                    tmpList.add(token);
+                }
+            } catch (NumberFormatException ignored) {
+            }
+        }
+
+        return tmpList.toArray(String[]::new);
+    }
+
+    private Set<BlockState> parseBlocksList(String blocks, String metadataLine) {
+        Set<BlockState> blockStates = new HashSet<>();
+
+        for (String blockString : blocks.split("\\s+")) {
+            StringBuilder metadata = new StringBuilder(metadataLine);
+            blockString = blockString.trim();
+            String[] blockComponents = blockString.split(":");
+            int tokensUsed = 0;
+            Block block;
+            block = this.getBlockFromName(blockComponents[0]);
+            if (block != null) {
+                tokensUsed = 1;
+            } else if (blockComponents.length > 1) {
+                block = this.getBlockFromName(blockComponents[0] + ":" + blockComponents[1]);
+                if (block != null) {
+                    tokensUsed = 2;
+                }
+            }
+
+            if (block != null) {
+                if (blockComponents.length > tokensUsed) {
+                    metadata = new StringBuilder(blockComponents[tokensUsed]);
+
+                    for (int t = tokensUsed + 1; t < blockComponents.length; ++t) {
+                        metadata.append(":").append(blockComponents[t]);
+                    }
+                }
+
+                blockStates.addAll(this.parseBlockMetadata(block, metadata.toString()));
+            }
+        }
+
+        return blockStates;
+    }
+
+    private Set<BlockState> parseBlockMetadata(Block block, String metadataList) {
+        Set<BlockState> blockStates = new HashSet<>();
+        if (metadataList.isEmpty()) {
+            blockStates.addAll(block.getStateDefinition().getPossibleStates());
+        } else {
+            Set<String> valuePairs = Arrays.stream(metadataList.split(":")).map(String::trim).filter(metadata -> metadata.contains("=")).collect(Collectors.toSet());
+
+            if (!valuePairs.isEmpty()) {
+
+                for (BlockState blockState : block.getStateDefinition().getPossibleStates()) {
+                    boolean matches = true;
+
+                    for (String pair : valuePairs) {
+                        String[] propertyAndValues = pair.split("\\s*=\\s*", 5);
+                        if (propertyAndValues.length == 2) {
+                            Property<?> property = block.getStateDefinition().getProperty(propertyAndValues[0]);
+                            if (property != null) {
+                                boolean valueIncluded = false;
+                                String[] values = propertyAndValues[1].split(",");
+
+                                for (String value : values) {
+                                    if (property.getValueClass() == Integer.class && value.matches("^\\d+-\\d+$")) {
+                                        String[] range = value.split("-");
+                                        int min = Integer.parseInt(range[0]);
+                                        int max = Integer.parseInt(range[1]);
+                                        int intValue = (Integer) blockState.getValue(property);
+                                        if (intValue >= min && intValue <= max) {
+                                            valueIncluded = true;
+                                        }
+                                    } else if (!blockState.getValue(property).equals(property.getValue(value).orElse(null))) {
+                                        valueIncluded = true;
+                                    }
+                                }
+
+                                matches = matches && valueIncluded;
+                            }
+                        }
+                    }
+
+                    if (matches) {
+                        blockStates.add(blockState);
+                    }
+                }
+            }
+        }
+
+        return blockStates;
+    }
+
+    private int parseBiomeName(String name) {
+        Biome biome = this.world.registryAccess().lookupOrThrow(Registries.BIOME).get(Identifier.parse(name)).get().value();
+        return biome != null ? this.world.registryAccess().lookupOrThrow(Registries.BIOME).getId(biome) : -1;
+    }
+
+    private List<Identifier> findResources(String namespace, String startingPath, String suffixMaybeNull, boolean recursive, boolean directories, boolean sortByFilename) {
+        if (startingPath == null) {
+            startingPath = "";
+        }
+
+        if (!startingPath.isEmpty() && startingPath.charAt(0) == '/') {
+            startingPath = startingPath.substring(1);
+        }
+
+        String suffix = suffixMaybeNull == null ? "" : suffixMaybeNull;
+        ArrayList<Identifier> resources;
+
+        Map<Identifier, Resource> resourceMap = VoxelConstants.getMinecraft().getResourceManager().listResources(startingPath, asset -> asset.getPath().endsWith(suffix));
+        resources = resourceMap.keySet().stream().filter(candidate -> candidate.getNamespace().equals(namespace)).collect(Collectors.toCollection(ArrayList::new));
+
+        if (sortByFilename) {
+            resources.sort((o1, o2) -> {
+                String f1 = o1.getPath().replaceAll(".*/", "").replaceFirst("\\.properties", "");
+                String f2 = o2.getPath().replaceAll(".*/", "").replaceFirst("\\.properties", "");
+                int result = f1.compareTo(f2);
+                return result != 0 ? result : o1.getPath().compareTo(o2.getPath());
+            });
+        } else {
+            resources.sort(Comparator.comparing(Identifier::getPath));
+        }
+
+        return resources;
+    }
+
+    private void processColorProperties() {
+        Properties properties = new Properties();
+
+        try {
+            InputStream input = VoxelConstants.getMinecraft().getResourceManager().getResource(Identifier.parse("optifine/color.properties")).get().open();
+            if (input != null) {
+                properties.load(input);
+                input.close();
+            }
+        } catch (IOException exception) {
+            VoxelConstants.getLogger().error(exception);
+        }
+
+        BlockState blockState = BlockRepository.lilypad.defaultBlockState();
+        int blockStateID = BlockRepository.getStateId(blockState);
+        int lilyRGB = this.getBlockColor(blockStateID);
+        int lilypadMultiplier = 2129968;
+        String lilypadMultiplierString = properties.getProperty("lilypad");
+        if (lilypadMultiplierString != null) {
+            lilypadMultiplier = Integer.parseInt(lilypadMultiplierString, 16);
+        }
+
+        for (UnmodifiableIterator<BlockState> defaultFormat = BlockRepository.lilypad.getStateDefinition().getPossibleStates().iterator(); defaultFormat.hasNext(); this.blockColorsWithDefaultTint[blockStateID] = this.blockColors[blockStateID]) {
+            BlockState padBlockState = defaultFormat.next();
+            blockStateID = BlockRepository.getStateId(padBlockState);
+            this.blockColors[blockStateID] = ColorUtils.colorMultiplier(lilyRGB, lilypadMultiplier | 0xFF000000);
+        }
+
+        String defaultFormat = properties.getProperty("palette.format");
+        boolean globalGrid = defaultFormat != null && defaultFormat.equalsIgnoreCase("grid");
+        Enumeration<?> e = properties.propertyNames();
+
+        while (e.hasMoreElements()) {
+            String key = (String) e.nextElement();
+            if (key.startsWith("palette.block")) {
+                String filename = key.substring("palette.block.".length());
+                filename = filename.replace("~", "optifine");
+                this.processColorPropertyHelper(Identifier.parse(filename), properties.getProperty(key), globalGrid);
+            }
+        }
+
+        for (Identifier resource : this.findResources("minecraft", "/optifine/colormap/blocks", ".properties", true, false, true)) {
+            Properties colorProperties = new Properties();
+
+            try {
+                InputStream input = VoxelConstants.getMinecraft().getResourceManager().getResource(resource).get().open();
+                if (input != null) {
+                    colorProperties.load(input);
+                    input.close();
+                }
+            } catch (IOException var21) {
+                break;
+            }
+
+            String names = colorProperties.getProperty("blocks");
+            if (names == null) {
+                String name = resource.getPath();
+                name = name.substring(name.lastIndexOf('/') + 1, name.lastIndexOf(".properties"));
+                names = name;
+            }
+
+            String source = colorProperties.getProperty("source");
+            Identifier resourcePNG;
+            if (source != null) {
+                resourcePNG = Identifier.fromNamespaceAndPath(resource.getNamespace(), source);
+
+                VoxelConstants.getMinecraft().getResourceManager().getResource(resourcePNG);
+            } else {
+                resourcePNG = Identifier.fromNamespaceAndPath(resource.getNamespace(), resource.getPath().replace(".properties", ".png"));
+            }
+
+            String format = colorProperties.getProperty("format");
+            boolean grid;
+            if (format != null) {
+                grid = format.equalsIgnoreCase("grid");
+            } else {
+                grid = globalGrid;
+            }
+
+            String yOffsetString = colorProperties.getProperty("yOffset");
+            int yOffset = 0;
+            if (yOffsetString != null) {
+                yOffset = Integer.parseInt(yOffsetString);
+            }
+
+            this.processColorProperty(resourcePNG, names, grid, yOffset);
+        }
+
+        this.processColorPropertyHelper(Identifier.parse("optifine/colormap/water.png"), "water", globalGrid);
+        this.processColorPropertyHelper(Identifier.parse("optifine/colormap/watercolorx.png"), "water", globalGrid);
+        this.processColorPropertyHelper(Identifier.parse("optifine/colormap/swampgrass.png"), "grass_block grass fern tall_grass large_fern", globalGrid);
+        this.processColorPropertyHelper(Identifier.parse("optifine/colormap/swampgrasscolor.png"), "grass_block grass fern tall_grass large_fern", globalGrid);
+        this.processColorPropertyHelper(Identifier.parse("optifine/colormap/swampfoliage.png"), "oak_leaves vine", globalGrid);
+        this.processColorPropertyHelper(Identifier.parse("optifine/colormap/swampfoliagecolor.png"), "oak_leaves vine", globalGrid);
+        this.processColorPropertyHelper(Identifier.parse("optifine/colormap/pine.png"), "spruce_leaves", globalGrid);
+        this.processColorPropertyHelper(Identifier.parse("optifine/colormap/pinecolor.png"), "spruce_leaves", globalGrid);
+        this.processColorPropertyHelper(Identifier.parse("optifine/colormap/birch.png"), "birch_leaves", globalGrid);
+        this.processColorPropertyHelper(Identifier.parse("optifine/colormap/birchcolor.png"), "birch_leaves", globalGrid);
+    }
+
+    private void processColorPropertyHelper(Identifier resource, String list, boolean grid) {
+        Identifier resourceProperties = Identifier.fromNamespaceAndPath(resource.getNamespace(), resource.getPath().replace(".png", ".properties"));
+        Properties colorProperties = new Properties();
+        int yOffset = 0;
+
+        try {
+            InputStream input = VoxelConstants.getMinecraft().getResourceManager().getResource(resourceProperties).get().open();
+            if (input != null) {
+                colorProperties.load(input);
+                input.close();
+            }
+
+            String format = colorProperties.getProperty("format");
+            if (format != null) {
+                grid = format.equalsIgnoreCase("grid");
+            }
+
+            String yOffsetString = colorProperties.getProperty("yOffset");
+            if (yOffsetString != null) {
+                yOffset = Integer.parseInt(yOffsetString);
+            }
+        } catch (IOException ignored) {
+        }
+
+        this.processColorProperty(resource, list, grid, yOffset);
+    }
+
+    private void processColorProperty(Identifier resource, String list, boolean grid, int yOffset) {
+        int[][] tints = new int[this.sizeOfBiomeArray][32];
+
+        for (int[] row : tints) {
+            Arrays.fill(row, -1);
+        }
+
+        boolean swamp = resource.getPath().contains("/swamp");
+        Image tintColors;
+
+        try {
+            InputStream is = VoxelConstants.getMinecraft().getResourceManager().getResource(resource).get().open();
+            tintColors = ImageIO.read(is);
+            is.close();
+        } catch (IOException var21) {
+            return;
+        }
+
+        BufferedImage tintColorsBuff = new BufferedImage(tintColors.getWidth(null), tintColors.getHeight(null), 1);
+        Graphics gfx = tintColorsBuff.createGraphics();
+        gfx.drawImage(tintColors, 0, 0, null);
+        gfx.dispose();
+        int numBiomesToCheck = grid ? Math.min(tintColorsBuff.getWidth(), this.sizeOfBiomeArray) : this.sizeOfBiomeArray;
+
+        for (int t = 0; t < numBiomesToCheck; ++t) {
+            Biome biome = this.world.registryAccess().lookupOrThrow(Registries.BIOME).byId(t);
+            if (biome != null) {
+                int tintMult;
+                int heightMultiplier = tintColorsBuff.getHeight() / 32;
+
+                for (int s = 0; s < 32; ++s) {
+                    if (grid) {
+                        tintMult = tintColorsBuff.getRGB(t, Math.max(0, s * heightMultiplier - yOffset)) & 16777215;
+                    } else {
+                        double var1 = Mth.clamp(biome.getBaseTemperature(), 0.0F, 1.0F);
+                        double var2 = Mth.clamp(VoxelConstants.getModApiBridge().getBiomeClimateSettings(biome).downfall(), 0.0F, 1.0F);
+
+                        var2 *= var1;
+                        var1 = 1.0 - var1;
+                        var2 = 1.0 - var2;
+                        tintMult = tintColorsBuff.getRGB((int) ((tintColorsBuff.getWidth() - 1) * var1), (int) ((tintColorsBuff.getHeight() - 1) * var2)) & 16777215;
+                    }
+
+                    if (tintMult != 0 && !swamp) {
+                        tints[t][s] = tintMult;
+                    }
+                }
+            }
+        }
+
+        Set<BlockState> blockStates = new HashSet<>(this.parseBlocksList(list, ""));
+
+        for (BlockState blockState : blockStates) {
+            int blockStateID = BlockRepository.getStateId(blockState);
+            int[][] previousTints = this.blockTintTables.get(blockStateID);
+            if (swamp && previousTints == null) {
+                Identifier defaultResource;
+                if (resource.getPath().contains("grass")) {
+                    defaultResource = Identifier.parse("textures/colormap/grass.png");
+                } else {
+                    defaultResource = Identifier.parse("textures/colormap/foliage.png");
+                }
+
+                String stateString = blockState.toString().toLowerCase();
+                stateString = stateString.replaceAll("^block", "");
+                stateString = stateString.replace("{", "");
+                stateString = stateString.replace("}", "");
+                stateString = stateString.replace("[", ":");
+                stateString = stateString.replace("]", "");
+                stateString = stateString.replace(",", ":");
+                this.processColorProperty(defaultResource, stateString, false, 0);
+                previousTints = this.blockTintTables.get(blockStateID);
+            }
+
+            if (previousTints != null) {
+                for (int t = 0; t < this.sizeOfBiomeArray; ++t) {
+                    for (int s = 0; s < 32; ++s) {
+                        if (tints[t][s] == -1) {
+                            tints[t][s] = previousTints[t][s];
+                        }
+                    }
+                }
+            }
+
+            this.blockColorsWithDefaultTint[blockStateID] = ColorUtils.colorMultiplier(this.getBlockColor(blockStateID), tints[4][8] | 0xFF000000);
+            this.blockTintTables.put(blockStateID, tints);
+            this.biomeTintsAvailable.add(blockStateID);
+        }
+
+    }
+
+    private Block getBlockFromName(String name) {
+        try {
+            Identifier identifier = Identifier.parse(name);
+            return BuiltInRegistries.BLOCK.containsKey(identifier) ? BuiltInRegistries.BLOCK.get(identifier).get().value() : null;
+        } catch (IdentifierException | NumberFormatException var3) {
+            return null;
+        }
+    }
+
+    @FunctionalInterface
+    private interface ColorResolver {
+        int getColorAtPos(BlockState state, Biome biome, BlockPos pos);
+    }
+}

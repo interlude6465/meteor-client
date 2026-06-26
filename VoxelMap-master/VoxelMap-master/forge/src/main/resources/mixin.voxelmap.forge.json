@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "compatibilityLevel": "JAVA_21",
+  "package": "com.mamiyaotaru.voxelmap.forge.mixins",
+  "target": "@env(DEFAULT)",
+  "client": [
+    "MixinRenderPipelines"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
