@@ -5,24 +5,31 @@
 
 package me.seedexplorer.addon.gui;
 
+import me.seedexplorer.addon.map.BiomeGenerator;
 import me.seedexplorer.addon.map.ChunkTile;
 import me.seedexplorer.addon.map.MinimapManager;
 import me.seedexplorer.addon.structures.GeneratedStructure;
 import me.seedexplorer.addon.structures.StructureCache;
+import me.seedexplorer.addon.structures.StructurePredictor;
 import me.seedexplorer.addon.structures.StructureType;
 import me.seedexplorer.addon.waypoints.SeedWaypoint;
 import me.seedexplorer.addon.waypoints.WaypointManager;
+import me.seedexplorer.addon.seed.SeedManager;
 import meteordevelopment.meteorclient.gui.GuiTheme;
 import meteordevelopment.meteorclient.gui.WidgetScreen;
 import meteordevelopment.meteorclient.gui.renderer.GuiRenderer;
+import meteordevelopment.meteorclient.gui.widgets.input.WTextBox;
 import meteordevelopment.meteorclient.renderer.Renderer2D;
+import meteordevelopment.meteorclient.utils.player.ChatUtils;
 import meteordevelopment.meteorclient.utils.render.color.Color;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.util.Mth;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Fullscreen infinite map screen for seed exploration.
@@ -58,6 +65,63 @@ public class SeedExplorerScreen extends WidgetScreen {
     private double contextMenuX, contextMenuY;
     private boolean isWaypointContextMenu; // true if context menu is for a waypoint, false for structure
 
+    // Search bar
+    private WTextBox searchBar;
+
+    // Biome name to ID mapping for search
+    private static final Map<String, Integer> BIOME_NAME_TO_ID = new HashMap<>();
+    static {
+        BIOME_NAME_TO_ID.put("ocean", 0);
+        BIOME_NAME_TO_ID.put("deep ocean", 1);
+        BIOME_NAME_TO_ID.put("warm ocean", 2);
+        BIOME_NAME_TO_ID.put("lukewarm ocean", 3);
+        BIOME_NAME_TO_ID.put("cold ocean", 4);
+        BIOME_NAME_TO_ID.put("deep lukewarm ocean", 5);
+        BIOME_NAME_TO_ID.put("deep cold ocean", 6);
+        BIOME_NAME_TO_ID.put("deep frozen ocean", 7);
+        BIOME_NAME_TO_ID.put("plains", 8);
+        BIOME_NAME_TO_ID.put("sunflower plains", 9);
+        BIOME_NAME_TO_ID.put("forest", 10);
+        BIOME_NAME_TO_ID.put("dark forest", 11);
+        BIOME_NAME_TO_ID.put("birch forest", 12);
+        BIOME_NAME_TO_ID.put("old growth birch forest", 13);
+        BIOME_NAME_TO_ID.put("taiga", 14);
+        BIOME_NAME_TO_ID.put("old growth taiga", 15);
+        BIOME_NAME_TO_ID.put("snowy taiga", 16);
+        BIOME_NAME_TO_ID.put("snowy plains", 17);
+        BIOME_NAME_TO_ID.put("snowy slopes", 18);
+        BIOME_NAME_TO_ID.put("ice spikes", 19);
+        BIOME_NAME_TO_ID.put("savanna", 20);
+        BIOME_NAME_TO_ID.put("savanna plateau", 21);
+        BIOME_NAME_TO_ID.put("desert", 22);
+        BIOME_NAME_TO_ID.put("badlands", 23);
+        BIOME_NAME_TO_ID.put("windswept hills", 24);
+        BIOME_NAME_TO_ID.put("windswept gravelly hills", 25);
+        BIOME_NAME_TO_ID.put("windswept forest", 26);
+        BIOME_NAME_TO_ID.put("stony peaks", 27);
+        BIOME_NAME_TO_ID.put("meadow", 28);
+        BIOME_NAME_TO_ID.put("jungle", 29);
+        BIOME_NAME_TO_ID.put("sparse jungle", 30);
+        BIOME_NAME_TO_ID.put("bamboo jungle", 31);
+        BIOME_NAME_TO_ID.put("swamp", 32);
+        BIOME_NAME_TO_ID.put("beach", 33);
+        BIOME_NAME_TO_ID.put("river", 34);
+        BIOME_NAME_TO_ID.put("mushroom fields", 35);
+        BIOME_NAME_TO_ID.put("nether wastes", 36);
+        BIOME_NAME_TO_ID.put("crimson forest", 37);
+        BIOME_NAME_TO_ID.put("warped forest", 38);
+        BIOME_NAME_TO_ID.put("soul sand valley", 39);
+        BIOME_NAME_TO_ID.put("basalt deltas", 40);
+        BIOME_NAME_TO_ID.put("the end", 41);
+        BIOME_NAME_TO_ID.put("end midlands", 42);
+        BIOME_NAME_TO_ID.put("end barrens", 43);
+        BIOME_NAME_TO_ID.put("small end islands", 44);
+        BIOME_NAME_TO_ID.put("cherry grove", 45);
+        BIOME_NAME_TO_ID.put("pale garden", 46);
+        BIOME_NAME_TO_ID.put("frozen ocean", 47);
+        BIOME_NAME_TO_ID.put("frozen river", 48);
+    }
+
     // Structure icon colors by type
     private static final Color VILLAGE_COLOR = new Color(180, 60, 60, 220);
     private static final Color DESERT_COLOR = new Color(220, 200, 80, 220);
@@ -86,6 +150,9 @@ public class SeedExplorerScreen extends WidgetScreen {
 
     @Override
     public void initWidgets() {
+        searchBar = theme.textBox("", "Search (X Z, structure, biome)...");
+        enterAction = this::onSearch;
+        add(searchBar).top().right().pad(10).width(250);
     }
 
     @Override
@@ -561,10 +628,208 @@ public class SeedExplorerScreen extends WidgetScreen {
         offsetZ = z;
     }
 
+    // ---- Search functionality ----
+
+    private void onSearch() {
+        if (searchBar == null) return;
+        String query = searchBar.get().trim();
+        if (query.isEmpty()) return;
+
+        // Try coordinate search first
+        if (tryCoordinateSearch(query)) return;
+
+        // Try structure search
+        if (tryStructureSearch(query)) return;
+
+        // Try biome search
+        if (tryBiomeSearch(query)) return;
+
+        // No results found
+        ChatUtils.info("Seed Explorer: No results found for \"(highlight)" + query + "(default)\".");
+    }
+
+    private boolean tryCoordinateSearch(String query) {
+        // Try parsing "X Z" format
+        String[] parts = query.split("\\s+");
+        if (parts.length == 2) {
+            try {
+                int x = Integer.parseInt(parts[0]);
+                int z = Integer.parseInt(parts[1]);
+                centerMap(x, z);
+                ChatUtils.info("Seed Explorer: Centered on coordinates (highlight)" + x + ", " + z + "(default).");
+                return true;
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return false;
+    }
+
+    private boolean tryStructureSearch(String query) {
+        StructureType matchedType = null;
+        for (StructureType type : StructureType.values()) {
+            if (type.displayName.equalsIgnoreCase(query)) {
+                matchedType = type;
+                break;
+            }
+        }
+        if (matchedType == null) return false;
+
+        // Check if this structure type is valid for the current dimension
+        if (matchedType.dimension != selectedDimension) {
+            ChatUtils.info("Seed Explorer: \"(highlight)" + matchedType.displayName + "(default)\" does not generate in the current dimension.");
+            return false;
+        }
+
+        long seed = SeedManager.get().getWorldSeed();
+        if (seed == 0) {
+            ChatUtils.info("Seed Explorer: No seed set.");
+            return false;
+        }
+        long s48 = seed & ((1L << 48) - 1);
+
+        // Start from current view center and search expanding regions
+        int centerBlockX = (int) offsetX;
+        int centerBlockZ = (int) offsetZ;
+
+        int originRegionX = Math.floorDiv(centerBlockX, matchedType.regionSize * 16);
+        int originRegionZ = Math.floorDiv(centerBlockZ, matchedType.regionSize * 16);
+
+        int searchRadius = 20; // Search 20 regions in each direction
+
+        GeneratedStructure closest = null;
+        double closestDist = Double.MAX_VALUE;
+
+        for (int dr = 0; dr <= searchRadius; dr++) {
+            for (int rz = -dr; rz <= dr; rz++) {
+                for (int rx = -dr; rx <= dr; rx++) {
+                    if (Math.abs(rx) != dr && Math.abs(rz) != dr) continue;
+
+                    int regX = originRegionX + rx;
+                    int regZ = originRegionZ + rz;
+
+                    GeneratedStructure gs = StructurePredictor.predictInRegionRaw(matchedType, s48, regX, regZ);
+                    if (gs != null) {
+                        double dx = gs.x - centerBlockX;
+                        double dz = gs.z - centerBlockZ;
+                        double dist = dx * dx + dz * dz;
+                        if (dist < closestDist) {
+                            closestDist = dist;
+                            closest = gs;
+                        }
+                    }
+                }
+            }
+            // If we found something at this radius, stop expanding
+            if (closest != null) break;
+        }
+
+        if (closest != null) {
+            centerMap(closest.x, closest.z);
+            ChatUtils.info("Seed Explorer: Found (highlight)" + matchedType.displayName + "(default) at (highlight)" + closest.x + ", " + closest.z + "(default).");
+            return true;
+        }
+
+        ChatUtils.info("Seed Explorer: No (highlight)" + matchedType.displayName + "(default) found within search range.");
+        return false;
+    }
+
+    private boolean tryBiomeSearch(String query) {
+        // Match query against biome name map (case-insensitive)
+        String lowerQuery = query.toLowerCase();
+        Integer biomeId = null;
+
+        // Try exact match first
+        if (BIOME_NAME_TO_ID.containsKey(lowerQuery)) {
+            biomeId = BIOME_NAME_TO_ID.get(lowerQuery);
+        } else {
+            // Try partial match
+            for (Map.Entry<String, Integer> entry : BIOME_NAME_TO_ID.entrySet()) {
+                if (entry.getKey().contains(lowerQuery)) {
+                    biomeId = entry.getValue();
+                    break;
+                }
+            }
+        }
+
+        if (biomeId == null) return false;
+
+        long seed = SeedManager.get().getWorldSeed();
+        if (seed == 0) {
+            ChatUtils.info("Seed Explorer: No seed set.");
+            return false;
+        }
+
+        int centerBlockX = (int) offsetX;
+        int centerBlockZ = (int) offsetZ;
+
+        // Search in expanding squares with step of 16 blocks (1 chunk)
+        int maxRadius = 10000; // Max search radius in blocks
+        int step = 16; // Check every chunk
+
+        for (int radius = 0; radius <= maxRadius; radius += step) {
+            // Search the perimeter of the current radius
+            // Top and bottom edges
+            for (int bx = -radius; bx <= radius; bx += step) {
+                if (radius == 0) {
+                    int id = BiomeGenerator.getBiome(centerBlockX, centerBlockZ, seed);
+                    if (id == biomeId) {
+                        centerMap(centerBlockX, centerBlockZ);
+                        ChatUtils.info("Seed Explorer: Found biome at (highlight)" + centerBlockX + ", " + centerBlockZ + "(default).");
+                        return true;
+                    }
+                    continue;
+                }
+
+                // Top edge: z = -radius
+                int idTop = BiomeGenerator.getBiome(centerBlockX + bx, centerBlockZ - radius, seed);
+                if (idTop == biomeId) {
+                    centerMap(centerBlockX + bx, centerBlockZ - radius);
+                    ChatUtils.info("Seed Explorer: Found biome at (highlight)" + (centerBlockX + bx) + ", " + (centerBlockZ - radius) + "(default).");
+                    return true;
+                }
+
+                // Bottom edge: z = radius
+                int idBottom = BiomeGenerator.getBiome(centerBlockX + bx, centerBlockZ + radius, seed);
+                if (idBottom == biomeId) {
+                    centerMap(centerBlockX + bx, centerBlockZ + radius);
+                    ChatUtils.info("Seed Explorer: Found biome at (highlight)" + (centerBlockX + bx) + ", " + (centerBlockZ + radius) + "(default).");
+                    return true;
+                }
+            }
+
+            // Left and right edges (excluding corners already checked)
+            for (int bz = -radius + step; bz <= radius - step; bz += step) {
+                // Left edge: x = -radius
+                int idLeft = BiomeGenerator.getBiome(centerBlockX - radius, centerBlockZ + bz, seed);
+                if (idLeft == biomeId) {
+                    centerMap(centerBlockX - radius, centerBlockZ + bz);
+                    ChatUtils.info("Seed Explorer: Found biome at (highlight)" + (centerBlockX - radius) + ", " + (centerBlockZ + bz) + "(default).");
+                    return true;
+                }
+
+                // Right edge: x = radius
+                int idRight = BiomeGenerator.getBiome(centerBlockX + radius, centerBlockZ + bz, seed);
+                if (idRight == biomeId) {
+                    centerMap(centerBlockX + radius, centerBlockZ + bz);
+                    ChatUtils.info("Seed Explorer: Found biome at (highlight)" + (centerBlockX + radius) + ", " + (centerBlockZ + bz) + "(default).");
+                    return true;
+                }
+            }
+        }
+
+        ChatUtils.info("Seed Explorer: No (highlight)" + query + "(default) biome found within " + maxRadius + " blocks.");
+        return false;
+    }
+
     @Override
     public boolean mouseClicked(net.minecraft.client.input.MouseButtonEvent click, boolean doubled) {
         if (contextMenuOpen) {
             handleContextMenuClick(click.x(), click.y());
+            return true;
+        }
+
+        // Let widgets (e.g. search bar) handle clicks first
+        if (super.mouseClicked(click, doubled)) {
             return true;
         }
 
@@ -619,7 +884,7 @@ public class SeedExplorerScreen extends WidgetScreen {
             }
         }
 
-        return super.mouseClicked(click, doubled);
+        return false;
     }
 
     @Override
@@ -671,6 +936,12 @@ public class SeedExplorerScreen extends WidgetScreen {
             selectedWaypoint = null;
             return true;
         }
-        return super.keyPressed(key);
+
+        // Let widgets (e.g. search bar) handle keys first
+        if (super.keyPressed(key)) {
+            return true;
+        }
+
+        return false;
     }
 }

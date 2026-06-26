@@ -123,7 +123,7 @@ public class BiomeGenerator {
      * Returns the biome ID for the given world coordinates using noise-based
      * generation seeded with the world seed.
      */
-    private static int getBiome(int x, int z, long seed) {
+    public static int getBiome(int x, int z, long seed) {
         // Use multiple layers of noise to determine biome properties
         double temperature = sampleNoise(x, z, seed, 0, 400, 2);
         double humidity = sampleNoise(x, z, seed, 1, 400, 2);

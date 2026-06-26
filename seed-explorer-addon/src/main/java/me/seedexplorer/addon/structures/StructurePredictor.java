@@ -74,7 +74,7 @@ public class StructurePredictor {
      * Uses the Cubiomes getFeaturePos / getLargeStructurePos logic.
      * Package-private for use by StructureCache.
      */
-    static GeneratedStructure predictInRegionRaw(StructureType type, long seed, int regX, int regZ) {
+    public static GeneratedStructure predictInRegionRaw(StructureType type, long seed, int regX, int regZ) {
         int chunkX, chunkZ;
 
         if (type.isLargeStructure()) {
