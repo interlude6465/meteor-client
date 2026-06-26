@@ -5,6 +5,21 @@
 
 package me.seedexplorer.addon.ore;
 
-/** Represents an ore patch found during seed analysis. */
+/**
+ * Represents a predicted ore patch location.
+ * Contains the block position and ore type.
+ */
 public class OrePatch {
+    public final int x, z;
+    public final OreType type;
+
+    public OrePatch(int x, int z, OreType type) {
+        this.x = x;
+        this.z = z;
+        this.type = type;
+    }
+
+    public String getCoordsString() {
+        return x + ", " + z;
+    }
 }
