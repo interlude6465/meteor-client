@@ -18,9 +18,10 @@ val meteorClientJar = file("/home/engine/project/build/libs/meteor-client-26.1.2
 val minecraftMergedJar = file("/home/engine/project/.gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-merged-ea76bb5afc/26.1.2/minecraft-merged-ea76bb5afc-26.1.2.jar")
 val brigadierJar = file("/home/engine/.gradle/caches/modules-2/files-2.1/com.mojang/brigadier/1.3.10/d15b53a14cf20fdcaa98f731af5dda654452c010/brigadier-1.3.10.jar")
 val orbitJar = file("/home/engine/.gradle/caches/modules-2/files-2.1/meteordevelopment/orbit/0.2.4/3a5ba3b5d3d5a43eda3b145bbe81cd5607f86422/orbit-0.2.4.jar")
+val fabricLoaderJar = file("/home/engine/.gradle/caches/modules-2/files-2.1/net.fabricmc/fabric-loader/0.19.2/cc647a5b22dbc49b9a3267cebcee25fc4882b108/fabric-loader-0.19.2.jar")
 
 dependencies {
-    compileOnly(files(meteorClientJar, minecraftMergedJar, brigadierJar, orbitJar))
+    compileOnly(files(meteorClientJar, minecraftMergedJar, brigadierJar, orbitJar, fabricLoaderJar))
 }
 
 java {

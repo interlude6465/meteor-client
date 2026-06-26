@@ -18,10 +18,9 @@ import meteordevelopment.orbit.EventHandler;
 import net.minecraft.client.Minecraft;
 
 import java.util.Map;
-import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 
-/** Manages map chunk tiles and their generation. */
+/** Manages map chunk tiles, their generation, and caching. */
 public class MinimapManager {
     private static final MinimapManager INSTANCE = new MinimapManager();
     private final Map<Long, ChunkTile> cache = new ConcurrentHashMap<>();
@@ -39,6 +38,10 @@ public class MinimapManager {
         clear();
     }
 
+    /**
+     * Retrieves a ChunkTile for the given chunk coordinates.
+     * Creates a new tile with async generation if it doesn't exist in the cache.
+     */
     public ChunkTile getTile(int x, int z) {
         long key = ((long) x << 32) | (z & 0xFFFFFFFFL);
         ChunkTile tile = cache.get(key);
@@ -50,43 +53,46 @@ public class MinimapManager {
         return tile;
     }
 
+    /**
+     * Launches a background task to generate the NativeImage for a chunk tile,
+     * then uploads the texture to the GPU on the main render thread.
+     */
     private void generateAsync(ChunkTile tile) {
+        if (!tile.markGenerating()) return;
+
         MeteorExecutor.execute(() -> {
-            long seed = SeedManager.get().getWorldSeed();
-            NativeImage image = new NativeImage(16, 16, false);
+            try {
+                long seed = SeedManager.get().getWorldSeed();
+                NativeImage image = new NativeImage(NativeImage.Format.RGBA, 16, 16, false);
 
-            for (int cz = 0; cz < 16; cz++) {
-                for (int cx = 0; cx < 16; cx++) {
-                    int worldX = tile.x * 16 + cx;
-                    int worldZ = tile.z * 16 + cz;
-                    int color = getBiomeColor(worldX, worldZ, seed);
-                    image.setPixelRGBA(cx, cz, color);
+                for (int cz = 0; cz < 16; cz++) {
+                    for (int cx = 0; cx < 16; cx++) {
+                        int worldX = tile.x * 16 + cx;
+                        int worldZ = tile.z * 16 + cz;
+                        int color = BiomeGenerator.getBiomeColor(worldX, worldZ);
+                        image.setPixelABGR(cx, cz, color);
+                    }
                 }
-            }
 
-            Minecraft.getInstance().execute(() -> {
-                Texture texture = new Texture(16, 16, TextureFormat.RGBA8, FilterMode.NEAREST, FilterMode.NEAREST);
-                RenderSystem.getDevice().createCommandEncoder().writeToTexture(texture.getTexture(), image);
-                tile.texture = texture;
-                image.close();
-            });
+                Minecraft.getInstance().execute(() -> {
+                    if (tile.texture != null) {
+                        tile.texture.close();
+                    }
+
+                    Texture texture = new Texture(16, 16, TextureFormat.RGBA8, FilterMode.NEAREST, FilterMode.NEAREST);
+                    RenderSystem.getDevice().createCommandEncoder().writeToTexture(texture.getTexture(), image);
+                    tile.texture = texture;
+                    tile.generating = false;
+                    image.close();
+                });
+            } catch (Exception e) {
+                tile.generating = false;
+                e.printStackTrace();
+            }
         });
     }
 
-    private int getBiomeColor(int x, int z, long seed) {
-        Random random = new Random(seed ^ ((long) x * 341873128712L) ^ ((long) z * 132897987541L));
-        float h = random.nextFloat();
-
-        // Biome colors (ABGR format for NativeImage)
-        if (h < 0.2) return 0xFF800000; // Deep Ocean
-        if (h < 0.3) return 0xFFFF0000; // Ocean
-        if (h < 0.35) return 0xFFE0FFFF; // Beach
-        if (h < 0.6) return 0xFF00FF00; // Plains
-        if (h < 0.8) return 0xFF006400; // Forest
-        if (h < 0.9) return 0xFF808080; // Mountains
-        return 0xFFFFFFFF; // Snow
-    }
-
+    /** Clears all cached tiles, disposing GPU resources. */
     public void clear() {
         for (ChunkTile tile : cache.values()) {
             tile.dispose();

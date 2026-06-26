@@ -11,23 +11,37 @@ import meteordevelopment.meteorclient.renderer.Texture;
 public class ChunkTile {
     public final int x, z;
     public Texture texture;
+    volatile boolean generating;
 
     public ChunkTile(int x, int z) {
         this.x = x;
         this.z = z;
+        this.generating = false;
     }
 
+    /** Whether the tile has been fully generated and its texture is ready. */
     public boolean isLoaded() {
         return texture != null;
     }
 
+    /** Whether this tile is currently being generated in the background. */
+    public boolean isGenerating() {
+        return generating;
+    }
+
+    /** Marks the start of async generation. Returns false if already generating. */
+    public boolean markGenerating() {
+        if (generating) return false;
+        generating = true;
+        return true;
+    }
+
+    /** Releases the GPU texture resource. */
     public void dispose() {
         if (texture != null) {
-            // In Meteor Client, Texture might need disposal if it's an AbstractTexture
-            // but we don't have a specific dispose method on Texture class we saw.
-            // AbstractTexture has close() in newer MC versions.
             texture.close();
             texture = null;
         }
+        generating = false;
     }
 }
