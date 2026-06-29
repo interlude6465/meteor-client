@@ -30,6 +30,11 @@ public final class PredictedMineChatBridge {
 
         String message = rawMessage == null ? "" : rawMessage.trim();
         String lower = message.toLowerCase(Locale.ROOT);
+        if ("#stop".equals(lower) && activeCommand.hasActivePredictedMineSession()) {
+            activeCommand.stopMinePredictedFromChat();
+            return false;
+        }
+
         if (!lower.startsWith("#mine predicted ") && !lower.startsWith("#mine seedexplorer ")) return false;
 
         String[] parts = message.split("\\s+");

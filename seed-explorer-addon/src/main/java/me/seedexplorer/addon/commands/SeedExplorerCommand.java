@@ -43,6 +43,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class SeedExplorerCommand extends Command {
     private static final double MINE_REACH_DISTANCE_SQUARED = 25.0;
+    private static final double PICKUP_DISTANCE_SQUARED = 4.0;
+    private static final int VEIN_SCAN_RADIUS = 6;
+    private static final int PICKUP_SETTLE_TICKS = 12;
+    private static final int PICKUP_TIMEOUT_TICKS = 80;
     private static final int TARGET_SKIP_TIMEOUT_TICKS = 20 * 90;
     private static final int PATH_REFRESH_TICKS = 100;
 
@@ -51,12 +55,16 @@ public class SeedExplorerCommand extends Command {
     private OreType predictedMineType;
     private int predictedMineDimension;
     private int predictedMineIndex;
-    private int predictedMinePathTargetIndex = -1;
+    private long predictedMinePathTargetKey = Long.MIN_VALUE;
     private int predictedMinePathRefreshTicks;
     private int predictedMineTargetTicks;
-    private boolean predictedMineSawOre;
+    private int predictedMineVeinIndex;
+    private int predictedMinePickupTicks;
+    private List<BlockPos> predictedMineVeinTargets = List.of();
+    private BlockPos predictedMinePickupPos;
     private boolean predictedMineActive;
     private boolean predictedMineBreaking;
+    private boolean predictedMinePickupActive;
 
     private static final List<String> OVERWORLD_LOCATE_BATCH = List.of(
         "minecraft:village_plains",
@@ -319,6 +327,10 @@ public class SeedExplorerCommand extends Command {
         return stopBaritonePathing();
     }
 
+    public boolean hasActivePredictedMineSession() {
+        return predictedMineActive;
+    }
+
     private int runMinePredicted(String oreName, int radiusChunks, int targetLimit) {
         if (mc.player == null || mc.level == null) {
             error("Join a world first.");
@@ -428,11 +440,15 @@ public class SeedExplorerCommand extends Command {
         predictedMineType = oreType;
         predictedMineDimension = oreType.dimension;
         predictedMineIndex = 0;
-        predictedMinePathTargetIndex = -1;
+        predictedMinePathTargetKey = Long.MIN_VALUE;
         predictedMinePathRefreshTicks = 0;
         predictedMineTargetTicks = 0;
-        predictedMineSawOre = false;
+        predictedMineVeinIndex = 0;
+        predictedMinePickupTicks = 0;
+        predictedMineVeinTargets = List.of();
+        predictedMinePickupPos = null;
         predictedMineBreaking = false;
+        predictedMinePickupActive = false;
         predictedMineActive = true;
 
         if (!pathToCurrentPredictedOre()) {
@@ -463,7 +479,7 @@ public class SeedExplorerCommand extends Command {
             return false;
         }
 
-        predictedMinePathTargetIndex = predictedMineIndex;
+        predictedMinePathTargetKey = BlockPos.asLong(target.x, target.y, target.z);
         predictedMinePathRefreshTicks = 0;
         return true;
     }
@@ -492,6 +508,16 @@ public class SeedExplorerCommand extends Command {
             return;
         }
 
+        if (predictedMinePickupActive) {
+            tickPredictedMinePickup();
+            return;
+        }
+
+        if (!predictedMineVeinTargets.isEmpty()) {
+            tickPredictedMineVein();
+            return;
+        }
+
         OrePatch target = currentPredictedMineTarget();
         if (target == null) {
             finishPredictedMineSession();
@@ -502,22 +528,12 @@ public class SeedExplorerCommand extends Command {
         BlockPos targetPos = new BlockPos(target.x, target.y, target.z);
         BlockState state = mc.level.getBlockState(targetPos);
         boolean targetIsOre = predictedMineType.matches(state);
-        if (targetIsOre) predictedMineSawOre = true;
-
-        if (predictedMineSawOre && !targetIsOre) {
-            markCurrentPredictedOreCleared();
-            advancePredictedMineTarget();
+        if (targetIsOre) {
+            beginPredictedMineVein(targetPos);
             return;
         }
 
         if (mc.player.distanceToSqr(target.x + 0.5, target.y + 0.5, target.z + 0.5) <= MINE_REACH_DISTANCE_SQUARED) {
-            if (targetIsOre) {
-                if (!predictedMineBreaking) cancelBaritonePathing(false);
-                predictedMineBreaking = true;
-                BlockUtils.breakBlock(targetPos, true);
-                return;
-            }
-
             if (predictedMineTargetTicks >= TARGET_SKIP_TIMEOUT_TICKS) {
                 warning("Skipping predicted %s at %d, %d, %d because it was not found after reaching it.",
                     target.type.displayName,
@@ -533,9 +549,114 @@ public class SeedExplorerCommand extends Command {
         predictedMineBreaking = false;
         predictedMinePathRefreshTicks++;
 
-        if (predictedMinePathTargetIndex != predictedMineIndex || predictedMinePathRefreshTicks >= PATH_REFRESH_TICKS) {
+        if (predictedMinePathTargetKey != BlockPos.asLong(target.x, target.y, target.z) || predictedMinePathRefreshTicks >= PATH_REFRESH_TICKS) {
             pathToCurrentPredictedOre();
         }
+    }
+
+    private void beginPredictedMineVein(BlockPos seedPos) {
+        predictedMineVeinTargets = findConnectedOreBlocks(seedPos);
+        predictedMineVeinIndex = 0;
+        predictedMineBreaking = false;
+        cancelBaritonePathing(false);
+        tickPredictedMineVein();
+    }
+
+    private void tickPredictedMineVein() {
+        while (predictedMineVeinIndex < predictedMineVeinTargets.size()) {
+            BlockPos pos = predictedMineVeinTargets.get(predictedMineVeinIndex);
+            BlockState state = mc.level.getBlockState(pos);
+
+            if (!predictedMineType.matches(state)) {
+                markOreCleared(pos);
+                predictedMinePickupPos = pos;
+                predictedMineVeinIndex++;
+                predictedMineBreaking = false;
+                continue;
+            }
+
+            if (mc.player.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5) <= MINE_REACH_DISTANCE_SQUARED) {
+                predictedMineBreaking = true;
+                BlockUtils.breakBlock(pos, true);
+                return;
+            }
+
+            predictedMineBreaking = false;
+            startBaritonePathing(List.of(new OrePatch(pos.getX(), pos.getY(), pos.getZ(), predictedMineType, true)), true);
+            return;
+        }
+
+        beginPredictedMinePickup();
+    }
+
+    private void beginPredictedMinePickup() {
+        predictedMineVeinTargets = List.of();
+        predictedMineVeinIndex = 0;
+        predictedMinePickupActive = true;
+        predictedMinePickupTicks = 0;
+
+        BlockPos pickup = predictedMinePickupPos;
+        if (pickup != null) {
+            startBaritonePathing(List.of(new OrePatch(pickup.getX(), pickup.getY(), pickup.getZ(), predictedMineType, true)), true);
+        }
+    }
+
+    private void tickPredictedMinePickup() {
+        predictedMinePickupTicks++;
+        BlockPos pickup = predictedMinePickupPos;
+        boolean closeEnough = pickup == null
+            || mc.player.distanceToSqr(pickup.getX() + 0.5, pickup.getY() + 0.5, pickup.getZ() + 0.5) <= PICKUP_DISTANCE_SQUARED;
+
+        if (closeEnough && predictedMinePickupTicks >= PICKUP_SETTLE_TICKS) {
+            predictedMinePickupActive = false;
+            predictedMinePickupPos = null;
+            advancePredictedMineTarget();
+            return;
+        }
+
+        if (predictedMinePickupTicks >= PICKUP_TIMEOUT_TICKS) {
+            predictedMinePickupActive = false;
+            predictedMinePickupPos = null;
+            advancePredictedMineTarget();
+            return;
+        }
+
+        if (pickup != null && predictedMinePickupTicks % PATH_REFRESH_TICKS == 1) {
+            startBaritonePathing(List.of(new OrePatch(pickup.getX(), pickup.getY(), pickup.getZ(), predictedMineType, true)), true);
+        }
+    }
+
+    private List<BlockPos> findConnectedOreBlocks(BlockPos seedPos) {
+        List<BlockPos> results = new ArrayList<>();
+        List<BlockPos> queue = new ArrayList<>();
+        Set<Long> seen = new HashSet<>();
+        queue.add(seedPos);
+        seen.add(seedPos.asLong());
+
+        for (int index = 0; index < queue.size() && results.size() < Math.max(1, predictedMineType.veinSize() * 3); index++) {
+            BlockPos pos = queue.get(index);
+            if (Math.abs(pos.getX() - seedPos.getX()) > VEIN_SCAN_RADIUS
+                || Math.abs(pos.getY() - seedPos.getY()) > VEIN_SCAN_RADIUS
+                || Math.abs(pos.getZ() - seedPos.getZ()) > VEIN_SCAN_RADIUS) {
+                continue;
+            }
+
+            if (!predictedMineType.matches(mc.level.getBlockState(pos))) continue;
+            results.add(pos);
+
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dz = -1; dz <= 1; dz++) {
+                        if (dx == 0 && dy == 0 && dz == 0) continue;
+                        BlockPos next = pos.offset(dx, dy, dz);
+                        if (seen.add(next.asLong())) queue.add(next);
+                    }
+                }
+            }
+        }
+
+        results.sort(Comparator.comparingLong(pos -> BlockPos.asLong(pos.getX(), pos.getY(), pos.getZ())));
+        return results.isEmpty() ? List.of(seedPos) : List.copyOf(results);
     }
 
     private void markCurrentPredictedOreCleared() {
@@ -552,11 +673,27 @@ public class SeedExplorerCommand extends Command {
         }
     }
 
+    private void markOreCleared(BlockPos pos) {
+        OrePatch patch = new OrePatch(pos.getX(), pos.getY(), pos.getZ(), predictedMineType, true);
+        int cleared = SeedManager.get().markClearedOrePatches(predictedMineDimension, List.of(patch));
+        if (cleared > 0) {
+            info("Mined predicted %s at %d, %d, %d.",
+                predictedMineType.displayName,
+                pos.getX(),
+                pos.getY(),
+                pos.getZ());
+        }
+    }
+
     private void advancePredictedMineTarget() {
         predictedMineIndex++;
         predictedMineBreaking = false;
         predictedMineTargetTicks = 0;
-        predictedMineSawOre = false;
+        predictedMineVeinIndex = 0;
+        predictedMinePickupTicks = 0;
+        predictedMineVeinTargets = List.of();
+        predictedMinePickupPos = null;
+        predictedMinePickupActive = false;
 
         if (predictedMineIndex >= predictedMineTargets.size()) {
             finishPredictedMineSession();
@@ -587,12 +724,16 @@ public class SeedExplorerCommand extends Command {
         predictedMineType = null;
         predictedMineDimension = 0;
         predictedMineIndex = 0;
-        predictedMinePathTargetIndex = -1;
+        predictedMinePathTargetKey = Long.MIN_VALUE;
         predictedMinePathRefreshTicks = 0;
         predictedMineTargetTicks = 0;
-        predictedMineSawOre = false;
+        predictedMineVeinIndex = 0;
+        predictedMinePickupTicks = 0;
+        predictedMineVeinTargets = List.of();
+        predictedMinePickupPos = null;
         predictedMineActive = false;
         predictedMineBreaking = false;
+        predictedMinePickupActive = false;
     }
 
     private List<OrePatch> filterMineTargets(List<OrePatch> candidates, int dimension, int maxTargets) {
