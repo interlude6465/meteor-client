@@ -43,6 +43,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class SeedExplorerCommand extends Command {
     private static final double MINE_REACH_DISTANCE_SQUARED = 25.0;
+    private static final int TARGET_SKIP_TIMEOUT_TICKS = 20 * 90;
     private static final int PATH_REFRESH_TICKS = 100;
 
     private final AtomicInteger minePredictionJobIds = new AtomicInteger();
@@ -52,6 +53,8 @@ public class SeedExplorerCommand extends Command {
     private int predictedMineIndex;
     private int predictedMinePathTargetIndex = -1;
     private int predictedMinePathRefreshTicks;
+    private int predictedMineTargetTicks;
+    private boolean predictedMineSawOre;
     private boolean predictedMineActive;
     private boolean predictedMineBreaking;
 
@@ -427,6 +430,8 @@ public class SeedExplorerCommand extends Command {
         predictedMineIndex = 0;
         predictedMinePathTargetIndex = -1;
         predictedMinePathRefreshTicks = 0;
+        predictedMineTargetTicks = 0;
+        predictedMineSawOre = false;
         predictedMineBreaking = false;
         predictedMineActive = true;
 
@@ -452,7 +457,7 @@ public class SeedExplorerCommand extends Command {
             return false;
         }
 
-        BaritoneResult result = startBaritonePathing(List.of(target));
+        BaritoneResult result = startBaritonePathing(List.of(target), true);
         if (!result.success()) {
             error(result.message());
             return false;
@@ -493,19 +498,36 @@ public class SeedExplorerCommand extends Command {
             return;
         }
 
+        predictedMineTargetTicks++;
         BlockPos targetPos = new BlockPos(target.x, target.y, target.z);
+        BlockState state = mc.level.getBlockState(targetPos);
+        boolean targetIsOre = predictedMineType.matches(state);
+        if (targetIsOre) predictedMineSawOre = true;
+
+        if (predictedMineSawOre && !targetIsOre) {
+            markCurrentPredictedOreCleared();
+            advancePredictedMineTarget();
+            return;
+        }
+
         if (mc.player.distanceToSqr(target.x + 0.5, target.y + 0.5, target.z + 0.5) <= MINE_REACH_DISTANCE_SQUARED) {
-            BlockState state = mc.level.getBlockState(targetPos);
-            if (!predictedMineType.matches(state)) {
+            if (targetIsOre) {
+                if (!predictedMineBreaking) cancelBaritonePathing(false);
+                predictedMineBreaking = true;
+                BlockUtils.breakBlock(targetPos, true);
+                return;
+            }
+
+            if (predictedMineTargetTicks >= TARGET_SKIP_TIMEOUT_TICKS) {
+                warning("Skipping predicted %s at %d, %d, %d because it was not found after reaching it.",
+                    target.type.displayName,
+                    target.x,
+                    target.y,
+                    target.z);
                 markCurrentPredictedOreCleared();
                 advancePredictedMineTarget();
                 return;
             }
-
-            if (!predictedMineBreaking) cancelBaritonePathing(false);
-            predictedMineBreaking = true;
-            BlockUtils.breakBlock(targetPos, true);
-            return;
         }
 
         predictedMineBreaking = false;
@@ -533,6 +555,8 @@ public class SeedExplorerCommand extends Command {
     private void advancePredictedMineTarget() {
         predictedMineIndex++;
         predictedMineBreaking = false;
+        predictedMineTargetTicks = 0;
+        predictedMineSawOre = false;
 
         if (predictedMineIndex >= predictedMineTargets.size()) {
             finishPredictedMineSession();
@@ -565,6 +589,8 @@ public class SeedExplorerCommand extends Command {
         predictedMineIndex = 0;
         predictedMinePathTargetIndex = -1;
         predictedMinePathRefreshTicks = 0;
+        predictedMineTargetTicks = 0;
+        predictedMineSawOre = false;
         predictedMineActive = false;
         predictedMineBreaking = false;
     }
@@ -609,12 +635,17 @@ public class SeedExplorerCommand extends Command {
     }
 
     private BaritoneResult startBaritonePathing(List<OrePatch> targets) {
+        return startBaritonePathing(targets, false);
+    }
+
+    private BaritoneResult startBaritonePathing(List<OrePatch> targets, boolean exactBlockGoal) {
         try {
             Class<?> apiClass = Class.forName("baritone.api.BaritoneAPI");
             Class<?> providerClass = Class.forName("baritone.api.IBaritoneProvider");
             Class<?> baritoneClass = Class.forName("baritone.api.IBaritone");
             Class<?> goalClass = Class.forName("baritone.api.pathing.goals.Goal");
             Class<?> getToBlockGoalClass = Class.forName("baritone.api.pathing.goals.GoalGetToBlock");
+            Class<?> blockGoalClass = Class.forName("baritone.api.pathing.goals.GoalBlock");
             Class<?> compositeGoalClass = Class.forName("baritone.api.pathing.goals.GoalComposite");
             Class<?> customGoalProcessClass = Class.forName("baritone.api.process.ICustomGoalProcess");
 
@@ -624,7 +655,7 @@ public class SeedExplorerCommand extends Command {
             Object baritone = providerClass.getMethod("getPrimaryBaritone").invoke(provider);
             if (baritone == null) return new BaritoneResult(false, "Baritone is not available.");
 
-            Object goal = createBaritoneGoal(targets, goalClass, getToBlockGoalClass, compositeGoalClass);
+            Object goal = createBaritoneGoal(targets, goalClass, exactBlockGoal ? blockGoalClass : getToBlockGoalClass, compositeGoalClass);
             Object customGoalProcess = baritoneClass.getMethod("getCustomGoalProcess").invoke(baritone);
             customGoalProcessClass.getMethod("setGoalAndPath", goalClass).invoke(customGoalProcess, goal);
             return new BaritoneResult(true, "started");
@@ -638,17 +669,17 @@ public class SeedExplorerCommand extends Command {
         }
     }
 
-    private Object createBaritoneGoal(List<OrePatch> targets, Class<?> goalClass, Class<?> getToBlockGoalClass, Class<?> compositeGoalClass)
+    private Object createBaritoneGoal(List<OrePatch> targets, Class<?> goalClass, Class<?> targetGoalClass, Class<?> compositeGoalClass)
         throws ReflectiveOperationException {
         if (targets.size() == 1) {
             OrePatch patch = targets.getFirst();
-            return getToBlockGoalClass.getConstructor(BlockPos.class).newInstance(new BlockPos(patch.x, patch.y, patch.z));
+            return targetGoalClass.getConstructor(BlockPos.class).newInstance(new BlockPos(patch.x, patch.y, patch.z));
         }
 
         Object goalArray = Array.newInstance(goalClass, targets.size());
         for (int i = 0; i < targets.size(); i++) {
             OrePatch patch = targets.get(i);
-            Object goal = getToBlockGoalClass.getConstructor(BlockPos.class).newInstance(new BlockPos(patch.x, patch.y, patch.z));
+            Object goal = targetGoalClass.getConstructor(BlockPos.class).newInstance(new BlockPos(patch.x, patch.y, patch.z));
             Array.set(goalArray, i, goal);
         }
 
