@@ -19,7 +19,11 @@ import me.seedexplorer.addon.workers.WorkerManager;
 import me.seedexplorer.addon.worldgen.PredictedBiome;
 import me.seedexplorer.addon.worldgen.VanillaStructurePredictor;
 import me.seedexplorer.addon.worldgen.WorldgenEngine;
+import meteordevelopment.meteorclient.MeteorClient;
 import meteordevelopment.meteorclient.commands.Command;
+import meteordevelopment.meteorclient.events.world.TickEvent;
+import meteordevelopment.meteorclient.utils.world.BlockUtils;
+import meteordevelopment.orbit.EventHandler;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.BlockPos;
 import net.minecraft.client.multiplayer.ClientSuggestionProvider;
@@ -38,7 +42,18 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class SeedExplorerCommand extends Command {
+    private static final double MINE_REACH_DISTANCE_SQUARED = 25.0;
+    private static final int PATH_REFRESH_TICKS = 100;
+
     private final AtomicInteger minePredictionJobIds = new AtomicInteger();
+    private List<OrePatch> predictedMineTargets = List.of();
+    private OreType predictedMineType;
+    private int predictedMineDimension;
+    private int predictedMineIndex;
+    private int predictedMinePathTargetIndex = -1;
+    private int predictedMinePathRefreshTicks;
+    private boolean predictedMineActive;
+    private boolean predictedMineBreaking;
 
     private static final List<String> OVERWORLD_LOCATE_BATCH = List.of(
         "minecraft:village_plains",
@@ -70,6 +85,7 @@ public class SeedExplorerCommand extends Command {
 
     public SeedExplorerCommand() {
         super("seed-explorer", "Base command for the Seed Explorer addon.");
+        MeteorClient.EVENT_BUS.subscribe(this);
     }
 
     @Override
@@ -398,20 +414,159 @@ public class SeedExplorerCommand extends Command {
             return;
         }
 
-        BaritoneResult result = startBaritonePathing(targets);
-        if (!result.success()) {
-            error(result.message());
+        startPredictedMineSession(oreType, targets);
+    }
+
+    private void startPredictedMineSession(OreType oreType, List<OrePatch> targets) {
+        if (predictedMineActive) stopPredictedMineSession(false);
+        else cancelBaritonePathing(false);
+
+        predictedMineTargets = List.copyOf(targets);
+        predictedMineType = oreType;
+        predictedMineDimension = oreType.dimension;
+        predictedMineIndex = 0;
+        predictedMinePathTargetIndex = -1;
+        predictedMinePathRefreshTicks = 0;
+        predictedMineBreaking = false;
+        predictedMineActive = true;
+
+        if (!pathToCurrentPredictedOre()) {
+            predictedMineActive = false;
             return;
         }
 
-        OrePatch first = targets.getFirst();
-        info("Baritone pathing to predicted %s: %d target%s, closest at %d, %d, %d.",
+        OrePatch first = predictedMineTargets.getFirst();
+        info("Mining predicted %s queue: %d target%s, first at %d, %d, %d.",
             oreType.displayName,
-            targets.size(),
-            targets.size() == 1 ? "" : "s",
+            predictedMineTargets.size(),
+            predictedMineTargets.size() == 1 ? "" : "s",
             first.x,
             first.y,
             first.z);
+    }
+
+    private boolean pathToCurrentPredictedOre() {
+        OrePatch target = currentPredictedMineTarget();
+        if (target == null) {
+            finishPredictedMineSession();
+            return false;
+        }
+
+        BaritoneResult result = startBaritonePathing(List.of(target));
+        if (!result.success()) {
+            error(result.message());
+            return false;
+        }
+
+        predictedMinePathTargetIndex = predictedMineIndex;
+        predictedMinePathRefreshTicks = 0;
+        return true;
+    }
+
+    private OrePatch currentPredictedMineTarget() {
+        if (!predictedMineActive || predictedMineIndex < 0 || predictedMineIndex >= predictedMineTargets.size()) return null;
+        return predictedMineTargets.get(predictedMineIndex);
+    }
+
+    @EventHandler
+    private void onTickPre(TickEvent.Pre event) {
+        tickPredictedMineSession();
+    }
+
+    private void tickPredictedMineSession() {
+        if (!predictedMineActive) return;
+
+        if (mc.player == null || mc.level == null || mc.gameMode == null) {
+            clearPredictedMineSession();
+            return;
+        }
+
+        if (dimensionId() != predictedMineDimension) {
+            warning("Stopped predicted mining because you changed dimension.");
+            stopPredictedMineSession(false);
+            return;
+        }
+
+        OrePatch target = currentPredictedMineTarget();
+        if (target == null) {
+            finishPredictedMineSession();
+            return;
+        }
+
+        BlockPos targetPos = new BlockPos(target.x, target.y, target.z);
+        if (mc.player.distanceToSqr(target.x + 0.5, target.y + 0.5, target.z + 0.5) <= MINE_REACH_DISTANCE_SQUARED) {
+            BlockState state = mc.level.getBlockState(targetPos);
+            if (!predictedMineType.matches(state)) {
+                markCurrentPredictedOreCleared();
+                advancePredictedMineTarget();
+                return;
+            }
+
+            if (!predictedMineBreaking) cancelBaritonePathing(false);
+            predictedMineBreaking = true;
+            BlockUtils.breakBlock(targetPos, true);
+            return;
+        }
+
+        predictedMineBreaking = false;
+        predictedMinePathRefreshTicks++;
+
+        if (predictedMinePathTargetIndex != predictedMineIndex || predictedMinePathRefreshTicks >= PATH_REFRESH_TICKS) {
+            pathToCurrentPredictedOre();
+        }
+    }
+
+    private void markCurrentPredictedOreCleared() {
+        OrePatch target = currentPredictedMineTarget();
+        if (target == null) return;
+
+        int cleared = SeedManager.get().markClearedOrePatches(predictedMineDimension, List.of(target));
+        if (cleared > 0) {
+            info("Mined predicted %s at %d, %d, %d.",
+                target.type.displayName,
+                target.x,
+                target.y,
+                target.z);
+        }
+    }
+
+    private void advancePredictedMineTarget() {
+        predictedMineIndex++;
+        predictedMineBreaking = false;
+
+        if (predictedMineIndex >= predictedMineTargets.size()) {
+            finishPredictedMineSession();
+            return;
+        }
+
+        pathToCurrentPredictedOre();
+    }
+
+    private void finishPredictedMineSession() {
+        int total = predictedMineTargets.size();
+        OreType type = predictedMineType;
+        clearPredictedMineSession();
+        cancelBaritonePathing(false);
+        if (type != null) info("Finished predicted %s mining queue: %d target%s.", type.displayName, total, total == 1 ? "" : "s");
+    }
+
+    private void stopPredictedMineSession(boolean announce) {
+        OreType type = predictedMineType;
+        int remaining = Math.max(0, predictedMineTargets.size() - predictedMineIndex);
+        clearPredictedMineSession();
+        cancelBaritonePathing(false);
+        if (announce && type != null) info("Stopped predicted %s mining queue with %d target%s remaining.", type.displayName, remaining, remaining == 1 ? "" : "s");
+    }
+
+    private void clearPredictedMineSession() {
+        predictedMineTargets = List.of();
+        predictedMineType = null;
+        predictedMineDimension = 0;
+        predictedMineIndex = 0;
+        predictedMinePathTargetIndex = -1;
+        predictedMinePathRefreshTicks = 0;
+        predictedMineActive = false;
+        predictedMineBreaking = false;
     }
 
     private List<OrePatch> filterMineTargets(List<OrePatch> candidates, int dimension, int maxTargets) {
@@ -501,7 +656,20 @@ public class SeedExplorerCommand extends Command {
     }
 
     private int stopBaritonePathing() {
+        return stopBaritonePathing(true);
+    }
+
+    private int stopBaritonePathing(boolean announce) {
         minePredictionJobIds.incrementAndGet();
+        if (predictedMineActive) {
+            stopPredictedMineSession(announce);
+            return SINGLE_SUCCESS;
+        }
+
+        return cancelBaritonePathing(announce);
+    }
+
+    private int cancelBaritonePathing(boolean announce) {
         try {
             Class<?> apiClass = Class.forName("baritone.api.BaritoneAPI");
             Class<?> providerClass = Class.forName("baritone.api.IBaritoneProvider");
@@ -512,14 +680,14 @@ public class SeedExplorerCommand extends Command {
             Object baritone = providerClass.getMethod("getPrimaryBaritone").invoke(provider);
             Object pathingBehavior = baritoneClass.getMethod("getPathingBehavior").invoke(baritone);
             pathingBehaviorClass.getMethod("cancelEverything").invoke(pathingBehavior);
-            info("Stopped Baritone pathing.");
+            if (announce) info("Stopped Baritone pathing.");
         } catch (ClassNotFoundException | NoClassDefFoundError ignored) {
-            error("Baritone is not installed or not loaded.");
+            if (announce) error("Baritone is not installed or not loaded.");
         } catch (ReflectiveOperationException exception) {
             Throwable cause = exception.getCause() == null ? exception : exception.getCause();
-            error("Could not stop Baritone: %s: %s", cause.getClass().getSimpleName(), cause.getMessage());
+            if (announce) error("Could not stop Baritone: %s: %s", cause.getClass().getSimpleName(), cause.getMessage());
         } catch (Throwable throwable) {
-            error("Could not stop Baritone: %s: %s", throwable.getClass().getSimpleName(), throwable.getMessage());
+            if (announce) error("Could not stop Baritone: %s: %s", throwable.getClass().getSimpleName(), throwable.getMessage());
         }
         return SINGLE_SUCCESS;
     }
