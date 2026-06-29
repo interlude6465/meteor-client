@@ -15,6 +15,7 @@ import me.seedexplorer.addon.ore.OreType;
 import me.seedexplorer.addon.seed.SeedManager;
 import me.seedexplorer.addon.structures.GeneratedStructure;
 import me.seedexplorer.addon.structures.PredictionStatus;
+import me.seedexplorer.addon.workers.WorkerManager;
 import me.seedexplorer.addon.worldgen.PredictedBiome;
 import me.seedexplorer.addon.worldgen.VanillaStructurePredictor;
 import me.seedexplorer.addon.worldgen.WorldgenEngine;
@@ -34,8 +35,11 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class SeedExplorerCommand extends Command {
+    private final AtomicInteger minePredictionJobIds = new AtomicInteger();
+
     private static final List<String> OVERWORLD_LOCATE_BATCH = List.of(
         "minecraft:village_plains",
         "minecraft:village_desert",
@@ -326,29 +330,78 @@ public class SeedExplorerCommand extends Command {
         BlockPos playerPos = mc.player.blockPosition();
         int radius = Math.max(1, Math.min(radiusChunks, 12));
         int maxTargets = Math.max(1, Math.min(targetLimit, 64));
-        List<OrePatch> candidates = OrePredictor.predictInChunkRadius(
-            Math.floorDiv(playerPos.getX(), 16),
-            Math.floorDiv(playerPos.getZ(), 16),
+        int centerChunkX = Math.floorDiv(playerPos.getX(), 16);
+        int centerChunkZ = Math.floorDiv(playerPos.getZ(), 16);
+        int centerX = playerPos.getX();
+        int centerY = playerPos.getY();
+        int centerZ = playerPos.getZ();
+        int jobId = minePredictionJobIds.incrementAndGet();
+
+        info("Searching predicted %s targets within %d chunk%s...",
+            oreType.displayName,
             radius,
+            radius == 1 ? "" : "s");
+
+        if (!WorkerManager.get().submit(() -> runMinePredictionJob(
+            jobId,
+            seed,
             dimension,
             oreType,
-            maxTargets * 3,
-            playerPos.getX(),
-            playerPos.getY(),
-            playerPos.getZ(),
-            seed
-        );
+            radius,
+            maxTargets,
+            centerChunkX,
+            centerChunkZ,
+            centerX,
+            centerY,
+            centerZ
+        ))) {
+            error("Seed Explorer worker queue is full. Try again in a moment.");
+        }
+
+        return SINGLE_SUCCESS;
+    }
+
+    private void runMinePredictionJob(int jobId, long seed, int dimension, OreType oreType, int radius,
+                                      int maxTargets, int centerChunkX, int centerChunkZ,
+                                      int centerX, int centerY, int centerZ) {
+        List<OrePatch> candidates;
+        try {
+            candidates = OrePredictor.predictInChunkRadius(
+                centerChunkX,
+                centerChunkZ,
+                radius,
+                dimension,
+                oreType,
+                maxTargets * 3,
+                centerX,
+                centerY,
+                centerZ,
+                seed
+            );
+        } catch (Throwable throwable) {
+            mc.execute(() -> error("Predicted ore search failed: %s: %s",
+                throwable.getClass().getSimpleName(),
+                throwable.getMessage()));
+            return;
+        }
 
         List<OrePatch> targets = filterMineTargets(candidates, dimension, maxTargets);
+
+        mc.execute(() -> finishMinePredictionJob(jobId, oreType, radius, targets));
+    }
+
+    private void finishMinePredictionJob(int jobId, OreType oreType, int radius, List<OrePatch> targets) {
+        if (jobId != minePredictionJobIds.get()) return;
+
         if (targets.isEmpty()) {
             warning("No uncleared predicted %s blocks found within %d chunks.", oreType.displayName, radius);
-            return SINGLE_SUCCESS;
+            return;
         }
 
         BaritoneResult result = startBaritonePathing(targets);
         if (!result.success()) {
             error(result.message());
-            return SINGLE_SUCCESS;
+            return;
         }
 
         OrePatch first = targets.getFirst();
@@ -359,7 +412,6 @@ public class SeedExplorerCommand extends Command {
             first.x,
             first.y,
             first.z);
-        return SINGLE_SUCCESS;
     }
 
     private List<OrePatch> filterMineTargets(List<OrePatch> candidates, int dimension, int maxTargets) {
@@ -449,6 +501,7 @@ public class SeedExplorerCommand extends Command {
     }
 
     private int stopBaritonePathing() {
+        minePredictionJobIds.incrementAndGet();
         try {
             Class<?> apiClass = Class.forName("baritone.api.BaritoneAPI");
             Class<?> providerClass = Class.forName("baritone.api.IBaritoneProvider");
