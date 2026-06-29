@@ -30,6 +30,10 @@ import net.minecraft.client.multiplayer.ClientSuggestionProvider;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
 
 import java.lang.reflect.Array;
 import java.util.ArrayList;
@@ -42,7 +46,6 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class SeedExplorerCommand extends Command {
-    private static final double MINE_REACH_DISTANCE_SQUARED = 25.0;
     private static final double PICKUP_DISTANCE_SQUARED = 4.0;
     private static final int VEIN_SCAN_RADIUS = 6;
     private static final int PICKUP_SETTLE_TICKS = 12;
@@ -533,17 +536,15 @@ public class SeedExplorerCommand extends Command {
             return;
         }
 
-        if (mc.player.distanceToSqr(target.x + 0.5, target.y + 0.5, target.z + 0.5) <= MINE_REACH_DISTANCE_SQUARED) {
-            if (predictedMineTargetTicks >= TARGET_SKIP_TIMEOUT_TICKS) {
-                warning("Skipping predicted %s at %d, %d, %d because it was not found after reaching it.",
-                    target.type.displayName,
-                    target.x,
-                    target.y,
-                    target.z);
-                markCurrentPredictedOreCleared();
-                advancePredictedMineTarget();
-                return;
-            }
+        if (predictedMineTargetTicks >= TARGET_SKIP_TIMEOUT_TICKS) {
+            warning("Skipping predicted %s at %d, %d, %d because it was not found.",
+                target.type.displayName,
+                target.x,
+                target.y,
+                target.z);
+            markCurrentPredictedOreCleared();
+            advancePredictedMineTarget();
+            return;
         }
 
         predictedMineBreaking = false;
@@ -575,14 +576,15 @@ public class SeedExplorerCommand extends Command {
                 continue;
             }
 
-            if (mc.player.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5) <= MINE_REACH_DISTANCE_SQUARED) {
+            if (canTargetBlock(pos)) {
+                cancelBaritonePathing(false);
                 predictedMineBreaking = true;
                 BlockUtils.breakBlock(pos, true);
                 return;
             }
 
             predictedMineBreaking = false;
-            startBaritonePathing(List.of(new OrePatch(pos.getX(), pos.getY(), pos.getZ(), predictedMineType, true)), true);
+            startBaritonePathing(List.of(new OrePatch(pos.getX(), pos.getY(), pos.getZ(), predictedMineType, true)), false);
             return;
         }
 
@@ -597,7 +599,7 @@ public class SeedExplorerCommand extends Command {
 
         BlockPos pickup = predictedMinePickupPos;
         if (pickup != null) {
-            startBaritonePathing(List.of(new OrePatch(pickup.getX(), pickup.getY(), pickup.getZ(), predictedMineType, true)), true);
+            pathNearPickup(pickup);
         }
     }
 
@@ -622,8 +624,23 @@ public class SeedExplorerCommand extends Command {
         }
 
         if (pickup != null && predictedMinePickupTicks % PATH_REFRESH_TICKS == 1) {
-            startBaritonePathing(List.of(new OrePatch(pickup.getX(), pickup.getY(), pickup.getZ(), predictedMineType, true)), true);
+            pathNearPickup(pickup);
         }
+    }
+
+    private void pathNearPickup(BlockPos pickup) {
+        startBaritonePathing(List.of(new OrePatch(pickup.getX(), pickup.getY(), pickup.getZ(), predictedMineType, true)), false);
+    }
+
+    private boolean canTargetBlock(BlockPos pos) {
+        if (mc.player == null || mc.level == null) return false;
+
+        Vec3 eyes = mc.player.getEyePosition();
+        Vec3 center = Vec3.atCenterOf(pos);
+        if (eyes.distanceToSqr(center) > mc.player.blockInteractionRange() * mc.player.blockInteractionRange()) return false;
+
+        BlockHitResult result = mc.level.clip(new ClipContext(eyes, center, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, mc.player));
+        return result.getType() == HitResult.Type.BLOCK && result.getBlockPos().equals(pos);
     }
 
     private List<BlockPos> findConnectedOreBlocks(BlockPos seedPos) {
