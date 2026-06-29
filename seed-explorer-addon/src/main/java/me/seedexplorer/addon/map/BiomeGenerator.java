@@ -6,6 +6,8 @@
 package me.seedexplorer.addon.map;
 
 import me.seedexplorer.addon.seed.SeedManager;
+import me.seedexplorer.addon.worldgen.PredictedBiome;
+import me.seedexplorer.addon.worldgen.WorldgenEngine;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -19,14 +21,11 @@ import java.util.Map;
  * NativeImage.setPixelABGR.
  */
 public class BiomeGenerator {
+    // Populated once in a static initializer so it is fully built and safely published
+    // before any thread can read it (the map is read from render/worker threads).
     private static final Map<Integer, Integer> BIOME_COLORS = new HashMap<>();
-    private static boolean initialized = false;
 
-    // Pre-compute colors
-    private static void ensureColors() {
-        if (initialized) return;
-        initialized = true;
-
+    static {
         // Colors in ABGR format (0xAABBGGRR)
         // Ocean biomes
         BIOME_COLORS.put(0, 0xFF5C2A1A);   // Ocean (dark blue)
@@ -110,12 +109,28 @@ public class BiomeGenerator {
      * @return ABGR color value suitable for NativeImage.setPixelABGR
      */
     public static int getBiomeColor(int x, int z) {
-        ensureColors();
+        return getBiomeColor(x, z, 0);
+    }
 
+    /**
+     * Returns the biome color (ABGR format) for the given world coordinates.
+     *
+     * @param x world block X coordinate
+     * @param z world block Z coordinate
+     * @param dimension 0=Overworld, -1=Nether, 1=End
+     * @return ABGR color value suitable for NativeImage.setPixelABGR
+     */
+    public static int getBiomeColor(int x, int z, int dimension) {
         long seed = SeedManager.get().getWorldSeed();
         if (seed == 0) return 0xFF2A2A2A; // dark gray for no seed
 
-        int biomeId = getBiome(x, z, seed);
+        PredictedBiome biome = getPredictedBiome(x, z, seed, dimension);
+        // Use the real biome's palette color whenever the engine identified a biome,
+        // even if it has no legacy id (e.g. modded/newer biomes still get a stable color).
+        // Only fall back to the handmade noise approximation when worldgen is unavailable.
+        if (!"unknown".equals(biome.id())) return biome.mapColorAbgr();
+
+        int biomeId = getFallbackBiome(x, z, seed);
         return BIOME_COLORS.getOrDefault(biomeId, 0xFF2A2A2A);
     }
 
@@ -124,6 +139,22 @@ public class BiomeGenerator {
      * generation seeded with the world seed.
      */
     public static int getBiome(int x, int z, long seed) {
+        PredictedBiome biome = getPredictedBiome(x, z, seed, 0);
+        if (biome.legacyId() >= 0) return biome.legacyId();
+        return getFallbackBiome(x, z, seed);
+    }
+
+    public static PredictedBiome getPredictedBiome(int x, int z, long seed, int dimension) {
+        PredictedBiome biome = WorldgenEngine.getBiome(seed, dimension, x, 64, z);
+        if (biome.legacyId() >= 0 || !"unknown".equals(biome.id())) return biome;
+        return PredictedBiome.UNKNOWN;
+    }
+
+    /**
+     * Previous handmade biome approximation. Kept only as a no-crash fallback
+     * if vanilla worldgen bootstrap is unavailable in a runtime environment.
+     */
+    private static int getFallbackBiome(int x, int z, long seed) {
         // Use multiple layers of noise to determine biome properties
         double temperature = sampleNoise(x, z, seed, 0, 400, 2);
         double humidity = sampleNoise(x, z, seed, 1, 400, 2);

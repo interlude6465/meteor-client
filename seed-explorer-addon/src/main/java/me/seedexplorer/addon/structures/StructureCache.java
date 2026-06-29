@@ -6,6 +6,9 @@
 package me.seedexplorer.addon.structures;
 
 import me.seedexplorer.addon.events.SeedChangeEvent;
+import me.seedexplorer.addon.seed.SeedManager;
+import me.seedexplorer.addon.worldgen.VanillaStructurePredictor;
+import me.seedexplorer.addon.workers.WorkerManager;
 import meteordevelopment.meteorclient.MeteorClient;
 import meteordevelopment.orbit.EventHandler;
 
@@ -23,8 +26,12 @@ public class StructureCache {
     // Cache keyed by region coordinates (64x64 chunk regions)
     // A region key is (rx << 32) | (rz & 0xFFFFFFFF)
     private final Map<Long, List<GeneratedStructure>> cache = new ConcurrentHashMap<>();
+    private final Map<Long, List<GeneratedStructure>> cacheWithTreasure = new ConcurrentHashMap<>();
+    private final Set<Long> pending = ConcurrentHashMap.newKeySet();
+    private final Set<Long> pendingWithTreasure = ConcurrentHashMap.newKeySet();
 
     private int lastDimension = 0;
+    private volatile int generation = 0;
 
     private StructureCache() {
         MeteorClient.EVENT_BUS.subscribe(this);
@@ -40,13 +47,19 @@ public class StructureCache {
     }
 
     /**
-     * Ensures that a specific 64x64 chunk region is cached.
-     * If not cached, computes all structure positions for that region.
+     * Queues a specific 64x64 chunk region for background caching.
      *
      * @param regionKey packed (rx << 32 | rz) region coordinates
      */
-    public void ensureRegion(long regionKey) {
-        if (cache.containsKey(regionKey)) return;
+    public void requestRegion(long regionKey, int dimension) {
+        requestRegion(regionKey, dimension, false);
+    }
+
+    public void requestRegion(long regionKey, int dimension, boolean includeBuriedTreasure) {
+        Map<Long, List<GeneratedStructure>> targetCache = includeBuriedTreasure ? cacheWithTreasure : cache;
+        Set<Long> targetPending = includeBuriedTreasure ? pendingWithTreasure : pending;
+        if (targetCache.containsKey(regionKey) || !targetPending.add(regionKey)) return;
+        int requestedGeneration = generation;
 
         int rx = (int) (regionKey >> 32);
         int rz = (int) (regionKey & 0xFFFFFFFFL);
@@ -59,55 +72,51 @@ public class StructureCache {
         int chunkEndX = chunkStartX + 63;
         int chunkEndZ = chunkStartZ + 63;
 
-        List<GeneratedStructure> structures = computeStructures(chunkStartX, chunkStartZ, chunkEndX, chunkEndZ);
-        cache.put(regionKey, structures);
+        if (!WorkerManager.get().submit(() -> {
+            try {
+                List<GeneratedStructure> structures = computeStructures(chunkStartX, chunkStartZ, chunkEndX, chunkEndZ, dimension, includeBuriedTreasure);
+                if (generation == requestedGeneration && lastDimension == dimension) {
+                    targetCache.put(regionKey, structures);
+                }
+            } finally {
+                targetPending.remove(regionKey);
+            }
+        })) {
+            targetPending.remove(regionKey);
+        }
     }
 
     /**
      * Computes all structure positions overlapping the given chunk range.
      */
-    private List<GeneratedStructure> computeStructures(int csx, int csz, int cex, int cez) {
+    private List<GeneratedStructure> computeStructures(int csx, int csz, int cex, int cez, int dimension, boolean includeBuriedTreasure) {
         List<GeneratedStructure> results = new ArrayList<>();
+        long seed = SeedManager.get().getWorldSeed();
+        if (seed == 0) return results;
 
-        for (StructureType type : StructureType.values()) {
-            if (type.dimension != lastDimension) continue;
-
-            // Calculate which structure regions overlap the given chunk range
-            int rMinX = Math.floorDiv(csx, type.regionSize);
-            int rMinZ = Math.floorDiv(csz, type.regionSize);
-            int rMaxX = Math.floorDiv(cex, type.regionSize);
-            int rMaxZ = Math.floorDiv(cez, type.regionSize);
-
-            long seed = me.seedexplorer.addon.seed.SeedManager.get().getWorldSeed();
-            if (seed == 0) continue;
-            long s48 = seed & ((1L << 48) - 1);
-
-            for (int rz = rMinZ; rz <= rMaxZ; rz++) {
-                for (int rx = rMinX; rx <= rMaxX; rx++) {
-                    GeneratedStructure gs = StructurePredictor.predictInRegionRaw(type, s48, rx, rz);
-                    if (gs != null) {
-                        // Check if the structure's block position is actually within our chunk range
-                        int gchunkX = gs.x >> 4;
-                        int gchunkZ = gs.z >> 4;
-                        if (gchunkX >= csx && gchunkX <= cex && gchunkZ >= csz && gchunkZ <= cez) {
-                            results.add(gs);
-                        }
-                    }
-                }
-            }
-        }
-
-        return results;
+        return VanillaStructurePredictor.predictDimension(seed, dimension, csx, csz, cex, cez, includeBuriedTreasure);
     }
 
     /**
      * Gets all cached structures within the given chunk bounds.
-     * Ensures all overlapping regions are cached first.
+     * Requests missing overlapping regions in the background.
      */
     public List<GeneratedStructure> getStructures(int chunkMinX, int chunkMinZ,
                                                    int chunkMaxX, int chunkMaxZ,
                                                    int dimension) {
-        this.lastDimension = dimension;
+        return getStructures(chunkMinX, chunkMinZ, chunkMaxX, chunkMaxZ, dimension, false);
+    }
+
+    public List<GeneratedStructure> getStructures(int chunkMinX, int chunkMinZ,
+                                                   int chunkMaxX, int chunkMaxZ,
+                                                   int dimension,
+                                                   boolean includeBuriedTreasure) {
+        if (lastDimension != dimension) {
+            clear();
+            lastDimension = dimension;
+        }
+
+        Map<Long, List<GeneratedStructure>> targetCache = includeBuriedTreasure ? cacheWithTreasure : cache;
 
         // Determine which 64x64 cache regions overlap the viewport
         int rMinX = Math.floorDiv(chunkMinX, 64);
@@ -119,7 +128,7 @@ public class StructureCache {
         for (int rz = rMinZ; rz <= rMaxZ; rz++) {
             for (int rx = rMinX; rx <= rMaxX; rx++) {
                 long key = ((long) rx << 32) | (rz & 0xFFFFFFFFL);
-                ensureRegion(key);
+                requestRegion(key, dimension, includeBuriedTreasure);
             }
         }
 
@@ -128,7 +137,7 @@ public class StructureCache {
         for (int rz = rMinZ; rz <= rMaxZ; rz++) {
             for (int rx = rMinX; rx <= rMaxX; rx++) {
                 long key = ((long) rx << 32) | (rz & 0xFFFFFFFFL);
-                List<GeneratedStructure> regionStructs = cache.get(key);
+                List<GeneratedStructure> regionStructs = targetCache.get(key);
                 if (regionStructs == null) continue;
 
                 for (GeneratedStructure gs : regionStructs) {
@@ -148,6 +157,10 @@ public class StructureCache {
      * Clears all cached structures, for example when the seed changes.
      */
     public void clear() {
+        generation++;
         cache.clear();
+        cacheWithTreasure.clear();
+        pending.clear();
+        pendingWithTreasure.clear();
     }
 }

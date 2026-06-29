@@ -20,17 +20,26 @@ public enum StructureType {
     MONUMENT("Ocean Monument", 0, 10387313, 32, 27, 0),
     MANSION("Woodland Mansion", 0, 10387319, 80, 60, 0),
     ANCIENT_CITY("Ancient City", 0, 20083232, 24, 16, 0),
+    TRIAL_CHAMBER("Trial Chamber", 0, 94251327, 34, 22, 0),
+    TRAIL_RUINS("Trail Ruins", 0, 83469867, 34, 26, 0),
+    STRONGHOLD("Stronghold", 0, 0, 1, 1, 0),
     RUINED_PORTAL("Ruined Portal", 0, 34222645, 40, 25, 0),
     SHIPWRECK("Shipwreck", 0, 165745295, 24, 20, 0),
     OCEAN_RUIN("Ocean Ruin", 0, 14357621, 20, 12, 0),
+    MINESHAFT("Mineshaft", 0, 0, 1, 1, 0),
+    DUNGEON("Dungeon", 0, 0, 1, 1, 0),
     TREASURE("Buried Treasure", 0, 10387320, 1, 1, 0),
+    AMETHYST_GEODE("Amethyst Geode", 0, 0, 1, 1, 0),
 
     // Nether structures
     FORTRESS("Nether Fortress", -1, 30084232, 27, 23, 0),
     BASTION("Bastion Remnant", -1, 30084232, 27, 23, 0),
+    NETHER_RUINED_PORTAL("Ruined Portal", -1, 34222645, 25, 15, 0),
+    NETHER_FOSSIL("Nether Fossil", -1, 14357921, 2, 1, 0),
 
     // End structures
-    END_CITY("End City", 1, 10387313, 20, 9, 0);
+    END_CITY("End City", 1, 10387313, 20, 9, 0),
+    END_GATEWAY("End Gateway", 1, 40000, 1, 1, 1.0f / 700.0f);
 
     public final String displayName;
     public final int dimension;  // 0=Overworld, -1=Nether, 1=End
@@ -50,5 +59,16 @@ public enum StructureType {
 
     public boolean isLargeStructure() {
         return this == MONUMENT || this == MANSION || this == END_CITY;
+    }
+
+    public boolean hasMapPrediction() {
+        return switch (this) {
+            case VILLAGE, DESERT_PYRAMID, JUNGLE_TEMPLE, WITCH_HUT, IGLOO,
+                 OUTPOST, MONUMENT, MANSION, ANCIENT_CITY, TRIAL_CHAMBER,
+                 TRAIL_RUINS, STRONGHOLD, RUINED_PORTAL, SHIPWRECK, OCEAN_RUIN,
+                 TREASURE, FORTRESS, BASTION, NETHER_RUINED_PORTAL, NETHER_FOSSIL,
+                 END_CITY, END_GATEWAY -> true;
+            default -> false;
+        };
     }
 }

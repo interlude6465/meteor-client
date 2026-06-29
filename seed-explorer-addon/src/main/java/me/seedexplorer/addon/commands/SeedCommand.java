@@ -19,25 +19,68 @@ public class SeedCommand extends Command {
 
     @Override
     public void build(LiteralArgumentBuilder<ClientSuggestionProvider> builder) {
+        builder.then(literal("set")
+            .then(argument("seed", StringArgumentType.word())
+                .executes(context -> {
+                    applySeed(context.getArgument("seed", String.class), "");
+                    return SINGLE_SUCCESS;
+                })
+                .then(argument("version", StringArgumentType.greedyString())
+                    .executes(context -> {
+                        applySeed(context.getArgument("seed", String.class), context.getArgument("version", String.class));
+                        return SINGLE_SUCCESS;
+                    })
+                )
+            )
+        );
+
+        builder.then(literal("seed")
+            .then(argument("seed", StringArgumentType.word())
+                .executes(context -> {
+                    applySeed(context.getArgument("seed", String.class), "");
+                    return SINGLE_SUCCESS;
+                })
+                .then(argument("version", StringArgumentType.greedyString())
+                    .executes(context -> {
+                        applySeed(context.getArgument("seed", String.class), context.getArgument("version", String.class));
+                        return SINGLE_SUCCESS;
+                    })
+                )
+            )
+        );
+
+        builder.then(literal("show").executes(context -> {
+            long seed = SeedManager.get().getWorldSeed();
+            String version = SeedManager.get().getMcVersion();
+            info("Current Seed Explorer seed: (highlight)%d(default)%s.",
+                seed,
+                version == null || version.isBlank() ? "" : " for version " + version);
+            return SINGLE_SUCCESS;
+        }));
+
         builder.then(argument("seed", StringArgumentType.word())
             .executes(context -> {
-                String seedStr = context.getArgument("seed", String.class);
-                long seed = parseSeed(seedStr);
-                SeedManager.get().setWorldSeed(seed);
-                info("Set seed to (highlight)%s(default) (numeric: (highlight)%d(default)).", seedStr, seed);
+                applySeed(context.getArgument("seed", String.class), "");
                 return SINGLE_SUCCESS;
             })
             .then(argument("version", StringArgumentType.greedyString())
                 .executes(context -> {
-                    String seedStr = context.getArgument("seed", String.class);
-                    String version = context.getArgument("version", String.class);
-                    long seed = parseSeed(seedStr);
-                    SeedManager.get().set(seed, version);
-                    info("Set seed to (highlight)%s(default) (numeric: (highlight)%d(default)) for version (highlight)%s(default).", seedStr, seed, version);
+                    applySeed(context.getArgument("seed", String.class), context.getArgument("version", String.class));
                     return SINGLE_SUCCESS;
                 })
             )
         );
+    }
+
+    private void applySeed(String seedStr, String version) {
+        long seed = parseSeed(seedStr);
+        if (version == null || version.isBlank()) {
+            SeedManager.get().setWorldSeed(seed);
+            info("Set Seed Explorer seed to (highlight)%s(default) (numeric: (highlight)%d(default)).", seedStr, seed);
+        } else {
+            SeedManager.get().set(seed, version);
+            info("Set Seed Explorer seed to (highlight)%s(default) (numeric: (highlight)%d(default)) for version (highlight)%s(default).", seedStr, seed, version);
+        }
     }
 
     private long parseSeed(String seed) {

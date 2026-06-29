@@ -10,12 +10,18 @@ import meteordevelopment.meteorclient.renderer.Texture;
 /** Represents a single chunk tile on the map. */
 public class ChunkTile {
     public final int x, z;
+    public final int dimension;
     public Texture texture;
     volatile boolean generating;
 
     public ChunkTile(int x, int z) {
+        this(x, z, 0);
+    }
+
+    public ChunkTile(int x, int z, int dimension) {
         this.x = x;
         this.z = z;
+        this.dimension = dimension;
         this.generating = false;
     }
 

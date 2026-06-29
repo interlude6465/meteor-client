@@ -6,73 +6,223 @@
 package me.seedexplorer.addon.ore;
 
 import me.seedexplorer.addon.seed.SeedManager;
+import me.seedexplorer.addon.worldgen.WorldgenEngine;
+import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.util.Mth;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.biome.FeatureSorter;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.levelgen.GenerationStep;
+import net.minecraft.world.level.levelgen.WorldgenRandom;
+import net.minecraft.world.level.levelgen.XoroshiroRandomSource;
+import net.minecraft.world.level.levelgen.feature.ConfiguredFeature;
+import net.minecraft.world.level.levelgen.feature.ScatteredOreFeature;
+import net.minecraft.world.level.levelgen.feature.configurations.OreConfiguration;
+import net.minecraft.world.level.levelgen.placement.PlacedFeature;
 
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 /**
- * Predicts ore patch locations using seed-based deterministic RNG.
- * For each ore type, checks every chunk using a coordinated-seeded
- * random number generator to determine if a patch generates and at
- * what position within the chunk.
+ * Predicts ore marker positions from vanilla placed-feature seed math.
  */
 public class OrePredictor {
-    private static final long K = 0x5deece66dL;       // Java RNG multiplier
-    private static final long M = (1L << 48) - 1;    // 48-bit mask
-    private static final long B = 0xbL;               // Java RNG increment
-    private static final long CHUNK_X_MULT = 341873128712L;
-    private static final long CHUNK_Z_MULT = 132897987541L;
+    private static final int OVERWORLD_ORE_STEP = GenerationStep.Decoration.UNDERGROUND_ORES.ordinal();
+    private static final int FEATURE_WRITE_RADIUS_CHUNKS = 1;
+    private static final ConcurrentMap<FeatureListKey, List<OreFeatureSpec>> FEATURE_CACHE = new ConcurrentHashMap<>();
+    private static final ConcurrentMap<ChunkOreKey, List<OrePatch>> CHUNK_CACHE = new ConcurrentHashMap<>();
 
     /**
      * Predicts all ore patches within a single chunk.
      *
      * @param chunkX Chunk X coordinate
      * @param chunkZ Chunk Z coordinate
-     * @param seed   The world seed (lower 48 bits)
+     * @param seed   The world seed
      * @param dimension The dimension to predict for (0=Overworld, -1=Nether, 1=End)
      * @return List of predicted OrePatch objects for this chunk
      */
     public static List<OrePatch> predictInChunk(int chunkX, int chunkZ, long seed, int dimension) {
+        if (seed == 0L) return List.of();
+        return predictedChunkOres(chunkX, chunkZ, seed, dimension);
+    }
+
+    /**
+     * Predicts one ore type inside a single chunk. Intended for debug reports.
+     */
+    public static List<OrePatch> predictInChunk(int chunkX, int chunkZ, long seed, int dimension, OreType oreType, int maxResults) {
+        if (seed == 0L || oreType.dimension != dimension || maxResults <= 0) return List.of();
+        return filterType(predictedChunkOres(chunkX, chunkZ, seed, dimension), oreType, maxResults);
+    }
+
+    /**
+     * Finds nearby in-world ore markers for a single target ore using prediction only.
+     */
+    public static List<OrePatch> predictInChunkRadius(int centerChunkX, int centerChunkZ,
+                                                       int radiusChunks, int dimension,
+                                                       OreType oreType, int maxResults) {
+        int centerBlockX = (centerChunkX << 4) + 8;
+        int centerBlockZ = (centerChunkZ << 4) + 8;
+        int centerBlockY = Math.max(oreType.minY, Math.min(oreType.maxY, 64));
+        return predictInChunkRadius(centerChunkX, centerChunkZ, radiusChunks, dimension, oreType, maxResults, centerBlockX, centerBlockY, centerBlockZ);
+    }
+
+    /**
+     * Finds nearby in-world ore markers for a single target ore using prediction only.
+     * Scans the whole requested radius, then keeps the closest predicted blocks.
+     */
+    public static List<OrePatch> predictInChunkRadius(int centerChunkX, int centerChunkZ,
+                                                       int radiusChunks, int dimension,
+                                                       OreType oreType, int maxResults,
+                                                       int centerBlockX, int centerBlockY, int centerBlockZ) {
+        long seed = SeedManager.get().getWorldSeed();
+        return predictInChunkRadius(centerChunkX, centerChunkZ, radiusChunks, dimension, oreType, maxResults, centerBlockX, centerBlockY, centerBlockZ, seed);
+    }
+
+    /**
+     * Finds nearby in-world ore markers with an explicit seed. Used by ESP and offline checks.
+     */
+    public static List<OrePatch> predictInChunkRadius(int centerChunkX, int centerChunkZ,
+                                                       int radiusChunks, int dimension,
+                                                       OreType oreType, int maxResults,
+                                                       int centerBlockX, int centerBlockY, int centerBlockZ,
+                                                       long seed) {
+        if (seed == 0L || oreType.dimension != dimension || maxResults <= 0) return List.of();
+
+        int radius = Math.max(0, Math.min(radiusChunks, 12));
+        List<OrePatch> range = predictOreTypeInChunkRangeFast(
+            centerChunkX - radius,
+            centerChunkZ - radius,
+            centerChunkX + radius,
+            centerChunkZ + radius,
+            seed,
+            dimension,
+            oreType
+        );
+
         List<OrePatch> results = new ArrayList<>();
+        for (OrePatch patch : range) {
+            if (patch.type == oreType) results.add(patch);
+        }
 
-        for (OreType type : OreType.values()) {
-            if (type.dimension != dimension) continue;
+        results.sort(Comparator.comparingLong(patch -> distanceSquared(patch, centerBlockX, centerBlockY, centerBlockZ)));
+        return results.size() > maxResults ? List.copyOf(results.subList(0, maxResults)) : List.copyOf(results);
+    }
 
-            OrePatch patch = predictSingle(type, chunkX, chunkZ, seed);
-            if (patch != null) {
+    /**
+     * Fast path for in-world ESP. It simulates only features that can produce
+     * the selected ore type instead of every ore-like feature in the step.
+     */
+    public static List<OrePatch> predictOreTypeInChunkRangeFast(int chunkMinX, int chunkMinZ,
+                                                                 int chunkMaxX, int chunkMaxZ,
+                                                                 long seed, int dimension,
+                                                                 OreType oreType) {
+        if (seed == 0L || oreType.dimension != dimension) return List.of();
+
+        int minChunkX = Math.min(chunkMinX, chunkMaxX);
+        int minChunkZ = Math.min(chunkMinZ, chunkMaxZ);
+        int maxChunkX = Math.max(chunkMinX, chunkMaxX);
+        int maxChunkZ = Math.max(chunkMinZ, chunkMaxZ);
+
+        List<OreFeatureSpec> specs = oreStepFeatures(seed, dimension).stream()
+            .filter(spec -> specTargetsType(spec, oreType))
+            .toList();
+
+        Map<Long, OrePatch> patches = new HashMap<>();
+        WorldgenEngine.TerrainAccessor baseTerrain = WorldgenEngine.terrainAccessor(seed, dimension);
+
+        if (!specs.isEmpty()) {
+            for (int originChunkZ = minChunkZ - FEATURE_WRITE_RADIUS_CHUNKS; originChunkZ <= maxChunkZ + FEATURE_WRITE_RADIUS_CHUNKS; originChunkZ++) {
+                for (int originChunkX = minChunkX - FEATURE_WRITE_RADIUS_CHUNKS; originChunkX <= maxChunkX + FEATURE_WRITE_RADIUS_CHUNKS; originChunkX++) {
+                    simulateOriginChunk(seed, dimension, originChunkX, originChunkZ, minChunkX, minChunkZ, maxChunkX, maxChunkZ, baseTerrain, specs, patches);
+                }
+            }
+        }
+
+        if (dimension == 0 && (oreType == OreType.IRON || oreType == OreType.COPPER)) {
+            WorldgenEngine.OreVeinAccessor veins = WorldgenEngine.oreVeinAccessor(seed);
+            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
+                for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+                    addOreVeinBlocks(patches, veins, baseTerrain, chunkX, chunkZ, oreType);
+                }
+            }
+        }
+
+        List<OrePatch> results = new ArrayList<>();
+        for (OrePatch patch : patches.values()) {
+            if (patch.type != oreType) continue;
+            int chunkX = Math.floorDiv(patch.x, 16);
+            int chunkZ = Math.floorDiv(patch.z, 16);
+            if (chunkX >= minChunkX && chunkX <= maxChunkX && chunkZ >= minChunkZ && chunkZ <= maxChunkZ) {
                 results.add(patch);
             }
         }
 
-        return results;
+        results.sort(Comparator
+            .comparingInt((OrePatch patch) -> patch.x)
+            .thenComparingInt(patch -> patch.z)
+            .thenComparingInt(patch -> patch.y)
+        );
+        return List.copyOf(results);
     }
 
     /**
-     * Predicts a single ore patch for the given type in the given chunk.
-     * Uses coordinated-seeded RNG to determine if a patch exists and its position.
+     * Debug helper only. Normal ore ESP does not use loaded chunks.
      */
-    private static OrePatch predictSingle(OreType type, int chunkX, int chunkZ, long seed) {
-        // Seed the RNG with world seed + chunk coordinates + ore salt
-        long rnd = seed + (long) chunkX * CHUNK_X_MULT + (long) chunkZ * CHUNK_Z_MULT + type.salt;
-        rnd = (rnd ^ K);
-        rnd = (rnd * K + B) & M;
+    public static List<OrePatch> scanLoadedChunks(int centerChunkX, int centerChunkZ,
+                                                   int radiusChunks, int dimension,
+                                                   OreType oreType, int maxResults) {
+        List<OrePatch> results = new ArrayList<>();
+        Minecraft mc = Minecraft.getInstance();
+        Level level = mc.level;
+        if (level == null || oreType.dimension != dimension || maxResults <= 0) return results;
 
-        // Check if a patch generates in this chunk
-        int roll = (int) (rnd >> 17) % 100;
-        if (roll >= type.chance) return null;
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        int minY = Math.max(level.getMinY(), oreType.minY);
+        int maxY = Math.min(level.getMaxY() - 1, oreType.maxY);
+        if (minY > maxY) return results;
 
-        // Determine position within the chunk (0-15 block offset)
-        rnd = (rnd * K + B) & M;
-        int blockOffsetX = (int) (rnd >> 17) % 16;
+        for (int dz = -radiusChunks; dz <= radiusChunks; dz++) {
+            for (int dx = -radiusChunks; dx <= radiusChunks; dx++) {
+                int chunkX = centerChunkX + dx;
+                int chunkZ = centerChunkZ + dz;
+                LevelChunk chunk = level.getChunkSource().getChunkNow(chunkX, chunkZ);
+                if (chunk == null) continue;
 
-        rnd = (rnd * K + B) & M;
-        int blockOffsetZ = (int) (rnd >> 17) % 16;
+                int baseX = chunkX << 4;
+                int baseZ = chunkZ << 4;
+                for (int y = minY; y <= maxY; y++) {
+                    for (int z = 0; z < 16; z++) {
+                        for (int x = 0; x < 16; x++) {
+                            pos.set(baseX + x, y, baseZ + z);
+                            if (!oreType.matches(chunk.getBlockState(pos))) continue;
 
-        // Convert to world block coordinates (center of the block)
-        int blockX = chunkX * 16 + blockOffsetX;
-        int blockZ = chunkZ * 16 + blockOffsetZ;
+                            results.add(new OrePatch(pos.getX(), pos.getY(), pos.getZ(), oreType, true));
+                            if (results.size() >= maxResults) return results;
+                        }
+                    }
+                }
+            }
+        }
 
-        return new OrePatch(blockX, blockZ, type);
+        return results;
     }
 
     /**
@@ -88,19 +238,971 @@ public class OrePredictor {
     public static List<OrePatch> predictInChunkRange(int chunkMinX, int chunkMinZ,
                                                       int chunkMaxX, int chunkMaxZ,
                                                       int dimension) {
-        List<OrePatch> results = new ArrayList<>();
-
         long seed = SeedManager.get().getWorldSeed();
-        if (seed == 0) return results;
+        if (seed == 0L) return List.of();
 
-        long s48 = seed & M;
+        return predictInChunkRange(chunkMinX, chunkMinZ, chunkMaxX, chunkMaxZ, seed, dimension);
+    }
 
-        for (int cz = chunkMinZ; cz <= chunkMaxZ; cz++) {
-            for (int cx = chunkMinX; cx <= chunkMaxX; cx++) {
-                results.addAll(predictInChunk(cx, cz, s48, dimension));
+    /**
+     * Predicts all ore patches for a range of chunks with an explicit seed.
+     * This simulates each origin chunk once and is much faster than asking for
+     * each target chunk separately.
+     */
+    public static List<OrePatch> predictInChunkRange(int chunkMinX, int chunkMinZ,
+                                                      int chunkMaxX, int chunkMaxZ,
+                                                      long seed, int dimension) {
+        if (seed == 0L) return List.of();
+
+        int minChunkX = Math.min(chunkMinX, chunkMaxX);
+        int minChunkZ = Math.min(chunkMinZ, chunkMaxZ);
+        int maxChunkX = Math.max(chunkMinX, chunkMaxX);
+        int maxChunkZ = Math.max(chunkMinZ, chunkMaxZ);
+
+        List<OreFeatureSpec> specs = oreStepFeatures(seed, dimension);
+        if (specs.isEmpty()) return List.of();
+
+        Map<Long, OrePatch> patches = new HashMap<>();
+        WorldgenEngine.TerrainAccessor baseTerrain = WorldgenEngine.terrainAccessor(seed, dimension);
+
+        for (int originChunkZ = minChunkZ - FEATURE_WRITE_RADIUS_CHUNKS; originChunkZ <= maxChunkZ + FEATURE_WRITE_RADIUS_CHUNKS; originChunkZ++) {
+            for (int originChunkX = minChunkX - FEATURE_WRITE_RADIUS_CHUNKS; originChunkX <= maxChunkX + FEATURE_WRITE_RADIUS_CHUNKS; originChunkX++) {
+                simulateOriginChunk(seed, dimension, originChunkX, originChunkZ, minChunkX, minChunkZ, maxChunkX, maxChunkZ, baseTerrain, specs, patches);
             }
         }
 
+        for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
+            for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+                addOreVeinBlocks(patches, baseTerrain, seed, dimension, chunkX, chunkZ);
+            }
+        }
+
+        List<OrePatch> results = new ArrayList<>();
+        for (OrePatch patch : patches.values()) {
+            int chunkX = Math.floorDiv(patch.x, 16);
+            int chunkZ = Math.floorDiv(patch.z, 16);
+            if (chunkX >= minChunkX && chunkX <= maxChunkX && chunkZ >= minChunkZ && chunkZ <= maxChunkZ) {
+                results.add(patch);
+            }
+        }
+
+        results.sort(Comparator
+            .comparingInt((OrePatch patch) -> patch.x)
+            .thenComparingInt(patch -> patch.z)
+            .thenComparingInt(patch -> patch.y)
+        );
+        cacheRangeResults(seed, dimension, minChunkX, minChunkZ, maxChunkX, maxChunkZ, results);
         return results;
+    }
+
+    /**
+     * Returns vanilla placed-feature diagnostics for ore-debug reports.
+     */
+    public static List<String> debugFeatureSummary(long seed, int dimension) {
+        List<String> lines = new ArrayList<>();
+        try {
+            List<FeatureSorter.StepFeatureData> steps = WorldgenEngine.featureSteps(seed, dimension);
+            HolderLookup.RegistryLookup<PlacedFeature> placedFeatures = WorldgenEngine.vanillaLookup().lookupOrThrow(Registries.PLACED_FEATURE);
+            Map<PlacedFeature, String> idsByFeature = placedFeatureIds(placedFeatures);
+            Map<String, FeatureLocation> locations = featureLocations(steps, idsByFeature);
+
+            lines.add("feature_steps=" + steps.size() + " overworld_ore_step=" + OVERWORLD_ORE_STEP);
+            lines.add("simulated_ore_feature_count=" + oreStepFeatures(seed, dimension).size());
+            lines.add("known_ore_features=");
+            for (String id : allOreLikePlacedFeatureIds()) {
+                ResourceKey<PlacedFeature> keyId = ResourceKey.create(Registries.PLACED_FEATURE, Identifier.parse(id));
+                Holder.Reference<PlacedFeature> holder = placedFeatures.get(keyId).orElse(null);
+                if (holder == null) {
+                    lines.add("  " + id + " missing_registry");
+                    continue;
+                }
+
+                PlacedFeature placedFeature = holder.value();
+                FeatureLocation location = locations.get(id);
+                ConfiguredFeature<?, ?> configured = placedFeature.feature().value();
+                String config = configured.config() instanceof OreConfiguration oreConfig
+                    ? "ore size=" + oreConfig.size + " discard=" + oreConfig.discardChanceOnAirExposure
+                    : configured.config().getClass().getSimpleName();
+                lines.add("  " + id
+                    + " step=" + (location == null ? -1 : location.stepIndex())
+                    + " index=" + (location == null ? -1 : location.featureIndex())
+                    + " in_step=" + (location != null)
+                    + " feature=" + configured.feature().getClass().getSimpleName()
+                    + " config=" + config
+                    + " placement=" + placedFeature.placement());
+            }
+
+            lines.add("ore_feature_order=");
+            for (int stepIndex = 0; stepIndex < steps.size(); stepIndex++) {
+                FeatureSorter.StepFeatureData step = steps.get(stepIndex);
+                for (int featureIndex = 0; featureIndex < step.features().size(); featureIndex++) {
+                    PlacedFeature feature = step.features().get(featureIndex);
+                    String id = idsByFeature.get(feature);
+                    if (id == null || placedFeatureData(id, dimension) == null) continue;
+
+                    ConfiguredFeature<?, ?> configured = feature.feature().value();
+                    if (configured.config() instanceof OreConfiguration oreConfig) {
+                        lines.add("  step=" + stepIndex + " index=" + featureIndex + " id=" + id
+                            + " feature=" + configured.feature().getClass().getSimpleName()
+                            + " size=" + oreConfig.size
+                            + " discard=" + oreConfig.discardChanceOnAirExposure
+                            + " placement=" + feature.placement()
+                            + " simulated=true");
+                    }
+                }
+            }
+        } catch (Throwable throwable) {
+            lines.add("feature_summary_error=" + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+        }
+
+        return List.copyOf(lines);
+    }
+
+    /**
+     * Debug helper for offline reports. Normal ore ESP does not call this.
+     */
+    public static List<String> debugOrePlacementTrace(long seed, int dimension, OreType oreType,
+                                                       int centerChunkX, int centerChunkZ,
+                                                       int radiusChunks, int sampleLimit) {
+        if (seed == 0L || oreType.dimension != dimension || sampleLimit <= 0) return List.of();
+
+        List<OreFeatureSpec> specs = oreStepFeatures(seed, dimension).stream()
+            .filter(spec -> specTargetsType(spec, oreType))
+            .toList();
+        if (specs.isEmpty()) return List.of("no matching ore feature specs");
+
+        int radius = Math.max(0, Math.min(radiusChunks, 12));
+        int minChunkX = centerChunkX - radius;
+        int minChunkZ = centerChunkZ - radius;
+        int maxChunkX = centerChunkX + radius;
+        int maxChunkZ = centerChunkZ + radius;
+
+        List<String> lines = new ArrayList<>();
+        Map<String, Integer> rejectionCounts = new LinkedHashMap<>();
+        WorldgenEngine.TerrainAccessor baseTerrain = WorldgenEngine.terrainAccessor(seed, dimension);
+
+        int sampled = 0;
+        int accepted = 0;
+        int candidates = 0;
+
+        for (int originChunkZ = minChunkZ - FEATURE_WRITE_RADIUS_CHUNKS; originChunkZ <= maxChunkZ + FEATURE_WRITE_RADIUS_CHUNKS; originChunkZ++) {
+            for (int originChunkX = minChunkX - FEATURE_WRITE_RADIUS_CHUNKS; originChunkX <= maxChunkX + FEATURE_WRITE_RADIUS_CHUNKS; originChunkX++) {
+                SimulatedTerrain terrain = new SimulatedTerrain(baseTerrain, dimension);
+                WorldgenRandom random = new WorldgenRandom(new XoroshiroRandomSource(0L));
+                long decorationSeed = random.setDecorationSeed(seed, originChunkX << 4, originChunkZ << 4);
+                BlockPos chunkOrigin = new BlockPos(originChunkX << 4, minBuildY(dimension), originChunkZ << 4);
+                Set<Holder<net.minecraft.world.level.biome.Biome>> decorationBiomes = WorldgenEngine.decorationBiomes(seed, dimension, originChunkX, originChunkZ);
+
+                for (OreFeatureSpec spec : specs) {
+                    if (!WorldgenEngine.anyBiomeHasFeature(decorationBiomes, spec.placedFeature())) {
+                        increment(rejectionCounts, spec.sourceId() + ":decoration_biome");
+                        continue;
+                    }
+
+                    random.setFeatureSeed(decorationSeed, spec.featureIndex(), spec.stepIndex());
+                    int count = spec.placement().sampleCount(random);
+                    if (count == 0) increment(rejectionCounts, spec.sourceId() + ":placement_count_zero");
+
+                    for (int placementIndex = 0; placementIndex < count; placementIndex++) {
+                        BlockPos origin = sampleOrigin(spec.placement(), random, chunkOrigin);
+                        if (origin == null) {
+                            increment(rejectionCounts, spec.sourceId() + ":origin_null");
+                            continue;
+                        }
+                        if (!WorldgenEngine.biomeHasFeature(seed, dimension, origin.getX(), origin.getY(), origin.getZ(), spec.placedFeature())) {
+                            increment(rejectionCounts, spec.sourceId() + ":origin_biome");
+                            continue;
+                        }
+
+                        int scatterCount = spec.scattered() ? random.nextInt(spec.size() + 1) : 1;
+                        if (scatterCount == 0) increment(rejectionCounts, spec.sourceId() + ":scatter_count_zero");
+
+                        for (int scatterIndex = 0; scatterIndex < scatterCount; scatterIndex++) {
+                            int x = origin.getX();
+                            int y = origin.getY();
+                            int z = origin.getZ();
+                            if (spec.scattered()) {
+                                int distance = Math.min(scatterIndex, 7);
+                                x += scatteredOffset(random, distance);
+                                y += scatteredOffset(random, distance);
+                                z += scatteredOffset(random, distance);
+                            }
+
+                            candidates++;
+                            String reason = null;
+                            if (!terrain.isInsideBuildHeight(y)) {
+                                reason = "outside_build_height";
+                            } else if (!canOriginWrite(originChunkX, originChunkZ, x, z)) {
+                                reason = "origin_write_window";
+                            }
+
+                            BlockState baseState = terrain.block(x, y, z);
+                            boolean targetMatch = false;
+                            for (OreConfiguration.TargetBlockState targetState : spec.targetStates()) {
+                                if (canReplaceTarget(spec, targetState, baseState, random)) {
+                                    targetMatch = true;
+                                    break;
+                                }
+                            }
+
+                            boolean adjacentAir = isAdjacentToAir(terrain, x, y, z);
+                            boolean wouldPlace = reason == null
+                                && targetMatch
+                                && (shouldSkipAirCheckForReport(spec.discardChanceOnAirExposure()) || !adjacentAir);
+
+                            if (wouldPlace) {
+                                accepted++;
+                            } else {
+                                if (reason == null && !targetMatch) reason = "target_miss";
+                                if (reason == null && adjacentAir) reason = "adjacent_air";
+                                increment(rejectionCounts, spec.sourceId() + ":" + reason);
+                            }
+
+                            if (sampled < sampleLimit) {
+                                lines.add(spec.sourceId()
+                                    + " origin_chunk=" + originChunkX + "," + originChunkZ
+                                    + " origin=" + origin.getX() + "," + origin.getY() + "," + origin.getZ()
+                                    + " candidate=" + x + "," + y + "," + z
+                                    + " base=" + blockStateId(baseState)
+                                    + " target=" + targetMatch
+                                    + " adjacent_air=" + adjacentAir
+                                    + " result=" + (wouldPlace ? "place" : reason));
+                                sampled++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        lines.add(0, "accepted=" + accepted + " candidates=" + candidates + " sampled=" + sampled);
+        if (!rejectionCounts.isEmpty()) lines.add(1, "rejections=" + rejectionCounts);
+        return List.copyOf(lines);
+    }
+
+    private static List<OrePatch> predictedChunkOres(int chunkX, int chunkZ, long seed, int dimension) {
+        return CHUNK_CACHE.computeIfAbsent(new ChunkOreKey(seed, dimension, chunkX, chunkZ),
+            key -> simulateTargetChunk(chunkX, chunkZ, seed, dimension)
+        );
+    }
+
+    private static List<OrePatch> simulateTargetChunk(int targetChunkX, int targetChunkZ, long seed, int dimension) {
+        List<OreFeatureSpec> specs = oreStepFeatures(seed, dimension);
+        if (specs.isEmpty()) return List.of();
+
+        Map<Long, OrePatch> patches = new HashMap<>();
+        WorldgenEngine.TerrainAccessor baseTerrain = WorldgenEngine.terrainAccessor(seed, dimension);
+
+        for (int originChunkZ = targetChunkZ - FEATURE_WRITE_RADIUS_CHUNKS; originChunkZ <= targetChunkZ + FEATURE_WRITE_RADIUS_CHUNKS; originChunkZ++) {
+            for (int originChunkX = targetChunkX - FEATURE_WRITE_RADIUS_CHUNKS; originChunkX <= targetChunkX + FEATURE_WRITE_RADIUS_CHUNKS; originChunkX++) {
+                simulateOriginChunk(seed, dimension, originChunkX, originChunkZ, targetChunkX, targetChunkZ, baseTerrain, specs, patches);
+            }
+        }
+
+        addOreVeinBlocks(patches, baseTerrain, seed, dimension, targetChunkX, targetChunkZ);
+
+        List<OrePatch> result = new ArrayList<>(patches.values());
+        result.sort(Comparator
+            .comparingInt((OrePatch patch) -> patch.x)
+            .thenComparingInt(patch -> patch.z)
+            .thenComparingInt(patch -> patch.y)
+        );
+        return List.copyOf(result);
+    }
+
+    private static void simulateOriginChunk(long seed,
+                                            int dimension,
+                                            int originChunkX,
+                                            int originChunkZ,
+                                            int targetChunkX,
+                                            int targetChunkZ,
+                                            WorldgenEngine.TerrainAccessor baseTerrain,
+                                            List<OreFeatureSpec> specs,
+                                            Map<Long, OrePatch> targetPatches) {
+        simulateOriginChunk(seed, dimension, originChunkX, originChunkZ, targetChunkX, targetChunkZ, targetChunkX, targetChunkZ, baseTerrain, specs, targetPatches);
+    }
+
+    private static void simulateOriginChunk(long seed,
+                                            int dimension,
+                                            int originChunkX,
+                                            int originChunkZ,
+                                            int minTargetChunkX,
+                                            int minTargetChunkZ,
+                                            int maxTargetChunkX,
+                                            int maxTargetChunkZ,
+                                            WorldgenEngine.TerrainAccessor baseTerrain,
+                                            List<OreFeatureSpec> specs,
+                                            Map<Long, OrePatch> targetPatches) {
+        SimulatedTerrain terrain = new SimulatedTerrain(baseTerrain, dimension);
+        WorldgenRandom random = new WorldgenRandom(new XoroshiroRandomSource(0L));
+        long decorationSeed = random.setDecorationSeed(seed, originChunkX << 4, originChunkZ << 4);
+        BlockPos chunkOrigin = new BlockPos(originChunkX << 4, minBuildY(dimension), originChunkZ << 4);
+        Set<Holder<net.minecraft.world.level.biome.Biome>> decorationBiomes = WorldgenEngine.decorationBiomes(seed, dimension, originChunkX, originChunkZ);
+
+        for (OreFeatureSpec spec : specs) {
+            if (!WorldgenEngine.anyBiomeHasFeature(decorationBiomes, spec.placedFeature())) continue;
+
+            random.setFeatureSeed(decorationSeed, spec.featureIndex(), spec.stepIndex());
+            int count = spec.placement().sampleCount(random);
+            for (int i = 0; i < count; i++) {
+                BlockPos origin = sampleOrigin(spec.placement(), random, chunkOrigin);
+                if (origin == null) continue;
+                if (!WorldgenEngine.biomeHasFeature(seed, dimension, origin.getX(), origin.getY(), origin.getZ(), spec.placedFeature())) continue;
+
+                if (spec.scattered()) {
+                    placeScatteredFeature(terrain, random, spec, origin, originChunkX, originChunkZ, minTargetChunkX, minTargetChunkZ, maxTargetChunkX, maxTargetChunkZ, targetPatches);
+                } else {
+                    placeVeinFeature(terrain, random, spec, origin, originChunkX, originChunkZ, minTargetChunkX, minTargetChunkZ, maxTargetChunkX, maxTargetChunkZ, targetPatches);
+                }
+            }
+        }
+    }
+
+    private static void placeVeinFeature(SimulatedTerrain terrain,
+                                         WorldgenRandom random,
+                                         OreFeatureSpec spec,
+                                         BlockPos origin,
+                                         int originChunkX,
+                                         int originChunkZ,
+                                         int minTargetChunkX,
+                                         int minTargetChunkZ,
+                                         int maxTargetChunkX,
+                                         int maxTargetChunkZ,
+                                         Map<Long, OrePatch> targetPatches) {
+        int size = spec.size();
+        float angle = random.nextFloat() * (float) Math.PI;
+        float horizontalSize = size / 8.0f;
+        int radius = Mth.ceil(((size / 16.0f) * 2.0f + 1.0f) / 2.0f);
+        double startX = origin.getX() + Math.sin(angle) * horizontalSize;
+        double endX = origin.getX() - Math.sin(angle) * horizontalSize;
+        double startZ = origin.getZ() + Math.cos(angle) * horizontalSize;
+        double endZ = origin.getZ() - Math.cos(angle) * horizontalSize;
+        double startY = origin.getY() + random.nextInt(3) - 2;
+        double endY = origin.getY() + random.nextInt(3) - 2;
+
+        int minSectionX = origin.getX() - Mth.ceil(horizontalSize) - radius;
+        int minSectionY = origin.getY() - 2 - radius;
+        int minSectionZ = origin.getZ() - Mth.ceil(horizontalSize) - radius;
+        int horizontalSpan = 2 * (Mth.ceil(horizontalSize) + radius);
+        int verticalSpan = 2 * (2 + radius);
+        if (isAboveTerrain(terrain, minSectionY, minSectionX, minSectionZ, horizontalSpan)) return;
+
+        double[] spheres = new double[size * 4];
+        for (int i = 0; i < size; i++) {
+            float t = (float) i / (float) size;
+            double centerX = Mth.lerp(t, startX, endX);
+            double centerY = Mth.lerp(t, startY, endY);
+            double centerZ = Mth.lerp(t, startZ, endZ);
+            double growth = random.nextDouble() * size / 16.0D;
+            double sphereRadius = ((Mth.sin((float) (Math.PI * t)) + 1.0D) * growth + 1.0D) / 2.0D;
+            int base = i * 4;
+            spheres[base] = centerX;
+            spheres[base + 1] = centerY;
+            spheres[base + 2] = centerZ;
+            spheres[base + 3] = sphereRadius;
+        }
+
+        removeCoveredSpheres(spheres, size);
+        Set<Integer> seen = new HashSet<>();
+        for (int i = 0; i < size; i++) {
+            int base = i * 4;
+            double sphereRadius = spheres[base + 3];
+            if (sphereRadius < 0.0D) continue;
+
+            double centerX = spheres[base];
+            double centerY = spheres[base + 1];
+            double centerZ = spheres[base + 2];
+            int minX = Math.max(Mth.floor(centerX - sphereRadius), minSectionX);
+            int minY = Math.max(Mth.floor(centerY - sphereRadius), minSectionY);
+            int minZ = Math.max(Mth.floor(centerZ - sphereRadius), minSectionZ);
+            int maxX = Math.max(Mth.floor(centerX + sphereRadius), minX);
+            int maxY = Math.max(Mth.floor(centerY + sphereRadius), minY);
+            int maxZ = Math.max(Mth.floor(centerZ + sphereRadius), minZ);
+
+            for (int x = minX; x <= maxX; x++) {
+                double dx = (x + 0.5D - centerX) / sphereRadius;
+                if (dx * dx >= 1.0D) continue;
+                for (int y = minY; y <= maxY; y++) {
+                    if (!terrain.isInsideBuildHeight(y)) continue;
+                    double dy = (y + 0.5D - centerY) / sphereRadius;
+                    if (dx * dx + dy * dy >= 1.0D) continue;
+                    for (int z = minZ; z <= maxZ; z++) {
+                        double dz = (z + 0.5D - centerZ) / sphereRadius;
+                        if (dx * dx + dy * dy + dz * dz >= 1.0D) continue;
+                        if (!canOriginWrite(originChunkX, originChunkZ, x, z)) continue;
+
+                        long posKey = BlockPos.asLong(x, y, z);
+                        int bitIndex = (x - minSectionX) + (y - minSectionY) * horizontalSpan + (z - minSectionZ) * horizontalSpan * verticalSpan;
+                        if (!seen.add(bitIndex)) continue;
+
+                        BlockState placedState = placeStateOrNull(terrain, spec, random, spec.targetStates(), spec.discardChanceOnAirExposure(), x, y, z);
+                        if (placedState == null) continue;
+
+                        terrain.setBlock(x, y, z, placedState);
+                        recordTargetWrite(targetPatches, spec, placedState, minTargetChunkX, minTargetChunkZ, maxTargetChunkX, maxTargetChunkZ, x, y, z, posKey);
+                    }
+                }
+            }
+        }
+    }
+
+    private static void placeScatteredFeature(SimulatedTerrain terrain,
+                                              WorldgenRandom random,
+                                              OreFeatureSpec spec,
+                                              BlockPos origin,
+                                              int originChunkX,
+                                              int originChunkZ,
+                                              int minTargetChunkX,
+                                              int minTargetChunkZ,
+                                              int maxTargetChunkX,
+                                              int maxTargetChunkZ,
+                                              Map<Long, OrePatch> targetPatches) {
+        int count = random.nextInt(spec.size() + 1);
+        Set<Long> seen = new HashSet<>();
+        for (int i = 0; i < count; i++) {
+            int distance = Math.min(i, 7);
+            int x = origin.getX() + scatteredOffset(random, distance);
+            int y = origin.getY() + scatteredOffset(random, distance);
+            int z = origin.getZ() + scatteredOffset(random, distance);
+            if (!terrain.isInsideBuildHeight(y)) continue;
+            if (!canOriginWrite(originChunkX, originChunkZ, x, z)) continue;
+
+            long posKey = BlockPos.asLong(x, y, z);
+            if (!seen.add(posKey)) continue;
+
+            BlockState placedState = placeStateOrNull(terrain, spec, random, spec.targetStates(), spec.discardChanceOnAirExposure(), x, y, z);
+            if (placedState == null) continue;
+
+            terrain.setBlock(x, y, z, placedState);
+            recordTargetWrite(targetPatches, spec, placedState, minTargetChunkX, minTargetChunkZ, maxTargetChunkX, maxTargetChunkZ, x, y, z, posKey);
+        }
+    }
+
+    private static boolean canOriginWrite(int originChunkX, int originChunkZ, int blockX, int blockZ) {
+        int chunkX = Math.floorDiv(blockX, 16);
+        int chunkZ = Math.floorDiv(blockZ, 16);
+        return Math.abs(chunkX - originChunkX) <= FEATURE_WRITE_RADIUS_CHUNKS
+            && Math.abs(chunkZ - originChunkZ) <= FEATURE_WRITE_RADIUS_CHUNKS;
+    }
+
+    private static void recordTargetWrite(Map<Long, OrePatch> targetPatches,
+                                          OreFeatureSpec spec,
+                                          BlockState placedState,
+                                          int minTargetChunkX,
+                                          int minTargetChunkZ,
+                                          int maxTargetChunkX,
+                                          int maxTargetChunkZ,
+                                          int x,
+                                          int y,
+                                          int z,
+                                          long posKey) {
+        int chunkX = Math.floorDiv(x, 16);
+        int chunkZ = Math.floorDiv(z, 16);
+        if (chunkX < minTargetChunkX || chunkX > maxTargetChunkX || chunkZ < minTargetChunkZ || chunkZ > maxTargetChunkZ) return;
+
+        OreType type = oreTypeForState(placedState);
+        if (type == null) {
+            targetPatches.remove(posKey);
+            return;
+        }
+
+        targetPatches.put(posKey, new OrePatch(x, y, z, type, false, spec.sourceId()));
+    }
+
+    private static void cacheRangeResults(long seed,
+                                          int dimension,
+                                          int minChunkX,
+                                          int minChunkZ,
+                                          int maxChunkX,
+                                          int maxChunkZ,
+                                          List<OrePatch> results) {
+        Map<ChunkOreKey, List<OrePatch>> byChunk = new HashMap<>();
+        for (OrePatch patch : results) {
+            int chunkX = Math.floorDiv(patch.x, 16);
+            int chunkZ = Math.floorDiv(patch.z, 16);
+            ChunkOreKey key = new ChunkOreKey(seed, dimension, chunkX, chunkZ);
+            byChunk.computeIfAbsent(key, ignored -> new ArrayList<>()).add(patch);
+        }
+
+        for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
+            for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+                ChunkOreKey key = new ChunkOreKey(seed, dimension, chunkX, chunkZ);
+                List<OrePatch> chunkPatches = byChunk.getOrDefault(key, List.of());
+                if (!chunkPatches.isEmpty()) {
+                    chunkPatches = new ArrayList<>(chunkPatches);
+                    chunkPatches.sort(Comparator
+                        .comparingInt((OrePatch patch) -> patch.x)
+                        .thenComparingInt(patch -> patch.z)
+                        .thenComparingInt(patch -> patch.y)
+                    );
+                }
+                CHUNK_CACHE.putIfAbsent(key, List.copyOf(chunkPatches));
+            }
+        }
+    }
+
+    private static BlockState placeStateOrNull(SimulatedTerrain terrain,
+                                               OreFeatureSpec spec,
+                                               WorldgenRandom random,
+                                               List<OreConfiguration.TargetBlockState> targetStates,
+                                               float discardChanceOnAirExposure,
+                                               int x,
+                                               int y,
+                                               int z) {
+        BlockState baseState = terrain.block(x, y, z);
+
+        for (OreConfiguration.TargetBlockState targetState : targetStates) {
+            if (!canReplaceTarget(spec, targetState, baseState, random)) continue;
+            if (shouldSkipAirCheck(random, discardChanceOnAirExposure)) return targetState.state;
+            if (!isAdjacentToAir(terrain, x, y, z)) return targetState.state;
+        }
+
+        return null;
+    }
+
+    private static boolean isAboveTerrain(SimulatedTerrain terrain, int minSectionY, int minSectionX, int minSectionZ, int horizontalSpan) {
+        for (int x = minSectionX; x <= minSectionX + horizontalSpan; x++) {
+            for (int z = minSectionZ; z <= minSectionZ + horizontalSpan; z++) {
+                if (minSectionY <= terrain.oceanFloorHeight(x, z)) return false;
+            }
+        }
+        return true;
+    }
+
+    private static void addOreVeinBlocks(Map<Long, OrePatch> patches,
+                                         WorldgenEngine.TerrainAccessor terrain,
+                                         long seed,
+                                         int dimension,
+                                         int chunkX,
+                                         int chunkZ) {
+        if (dimension != 0) return;
+
+        WorldgenEngine.OreVeinAccessor veins = WorldgenEngine.oreVeinAccessor(seed);
+        addOreVeinBlocks(patches, veins, terrain, chunkX, chunkZ, OreType.IRON);
+        addOreVeinBlocks(patches, veins, terrain, chunkX, chunkZ, OreType.COPPER);
+    }
+
+    private static void addOreVeinBlocks(Map<Long, OrePatch> patches,
+                                         WorldgenEngine.OreVeinAccessor veins,
+                                         WorldgenEngine.TerrainAccessor terrain,
+                                         int chunkX,
+                                         int chunkZ,
+                                         OreType oreType) {
+        int minY = oreType == OreType.COPPER ? 0 : -60;
+        int maxY = oreType == OreType.COPPER ? 50 : -8;
+        int baseX = chunkX << 4;
+        int baseZ = chunkZ << 4;
+
+        for (int y = minY; y <= maxY; y++) {
+            for (int z = 0; z < 16; z++) {
+                for (int x = 0; x < 16; x++) {
+                    int blockX = baseX + x;
+                    int blockZ = baseZ + z;
+                    if (!isOreVeinBlock(veins, terrain, blockX, y, blockZ, oreType)) continue;
+
+                    long posKey = BlockPos.asLong(blockX, y, blockZ);
+                    patches.putIfAbsent(posKey, new OrePatch(blockX, y, blockZ, oreType, false, "ore_vein"));
+                }
+            }
+        }
+    }
+
+    private static boolean isOreVeinBlock(WorldgenEngine.OreVeinAccessor veins,
+                                          WorldgenEngine.TerrainAccessor terrain,
+                                          int blockX,
+                                          int blockY,
+                                          int blockZ,
+                                          OreType oreType) {
+        double veininess = veins.veinToggle(blockX, blockY, blockZ);
+        if (oreType == OreType.COPPER && veininess <= 0.0D) return false;
+        if (oreType == OreType.IRON && veininess >= 0.0D) return false;
+
+        int minY = oreType == OreType.COPPER ? 0 : -60;
+        int maxY = oreType == OreType.COPPER ? 50 : -8;
+        int edgeDistance = Math.min(maxY - blockY, blockY - minY);
+        if (edgeDistance < 0) return false;
+
+        double edgeRoundoff = Mth.clampedMap(edgeDistance, 0.0D, 20.0D, -0.2D, 0.0D);
+        double absVeininess = Math.abs(veininess);
+        if (absVeininess + edgeRoundoff < 0.4000000059604645D) return false;
+        if (veins.oreRandomFloat(blockX, blockY, blockZ, 0) > 0.7f) return false;
+        if (veins.veinRidged(blockX, blockY, blockZ) >= 0.0D) return false;
+
+        double richness = Mth.clampedMap(absVeininess, 0.4000000059604645D, 0.6000000238418579D, 0.10000000149011612D, 0.30000001192092896D);
+        if (veins.oreRandomFloat(blockX, blockY, blockZ, 1) >= richness) return false;
+        if (veins.veinGap(blockX, blockY, blockZ) <= -0.30000001192092896D) return false;
+        if (!canReplaceForOreVein(terrain, blockX, blockY, blockZ)) return false;
+
+        // Vanilla uses this final roll to choose raw ore blocks 2% of the time.
+        // The ESP highlights ore blocks only, so skip the raw-block positions.
+        return veins.oreRandomFloat(blockX, blockY, blockZ, 2) >= 0.02f;
+    }
+
+    private static boolean canReplaceForOreVein(WorldgenEngine.TerrainAccessor terrain, int blockX, int blockY, int blockZ) {
+        BlockState state = terrain.block(blockX, blockY, blockZ);
+        return state.is(Blocks.STONE) || state.is(Blocks.DEEPSLATE) || state.is(Blocks.TUFF);
+    }
+
+    private static List<OrePatch> filterType(List<OrePatch> patches, OreType type, int maxResults) {
+        List<OrePatch> results = new ArrayList<>();
+        for (OrePatch patch : patches) {
+            if (patch.type != type) continue;
+            results.add(patch);
+            if (results.size() >= maxResults) break;
+        }
+        return List.copyOf(results);
+    }
+
+    private static long distanceSquared(OrePatch patch, int centerBlockX, int centerBlockY, int centerBlockZ) {
+        long dx = patch.x - centerBlockX;
+        long dy = patch.y - centerBlockY;
+        long dz = patch.z - centerBlockZ;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private static List<OreFeatureSpec> oreStepFeatures(long seed, int dimension) {
+        return FEATURE_CACHE.computeIfAbsent(new FeatureListKey(seed, dimension), key -> {
+            List<OreFeatureSpec> specs = new ArrayList<>();
+            try {
+                List<FeatureSorter.StepFeatureData> steps = WorldgenEngine.featureSteps(seed, dimension);
+                HolderLookup.RegistryLookup<PlacedFeature> placedFeatures = WorldgenEngine.vanillaLookup().lookupOrThrow(Registries.PLACED_FEATURE);
+                Map<PlacedFeature, String> idsByFeature = placedFeatureIds(placedFeatures);
+
+                for (int stepIndex = 0; stepIndex < steps.size(); stepIndex++) {
+                    FeatureSorter.StepFeatureData step = steps.get(stepIndex);
+                    for (int featureIndex = 0; featureIndex < step.features().size(); featureIndex++) {
+                        PlacedFeature placedFeature = step.features().get(featureIndex);
+                        ConfiguredFeature<?, ?> configured = placedFeature.feature().value();
+                        if (!(configured.config() instanceof OreConfiguration oreConfig)) continue;
+
+                        String id = idsByFeature.get(placedFeature);
+                        PlacementData placement = id == null ? null : placedFeatureData(id, dimension);
+                        if (placement == null) continue;
+
+                        specs.add(new OreFeatureSpec(
+                            id,
+                            placedFeature,
+                            stepIndex,
+                            featureIndex,
+                            placement,
+                            oreConfig.targetStates,
+                            oreConfig.size,
+                            oreConfig.discardChanceOnAirExposure,
+                            configured.feature() instanceof ScatteredOreFeature
+                        ));
+                    }
+                }
+            } catch (Throwable ignored) {
+                return List.of();
+            }
+
+            specs.sort(Comparator
+                .comparingInt(OreFeatureSpec::stepIndex)
+                .thenComparingInt(OreFeatureSpec::featureIndex));
+            return List.copyOf(specs);
+        });
+    }
+
+    private static Map<String, FeatureLocation> featureLocations(List<FeatureSorter.StepFeatureData> steps, Map<PlacedFeature, String> idsByFeature) {
+        Map<String, FeatureLocation> locations = new LinkedHashMap<>();
+        for (int stepIndex = 0; stepIndex < steps.size(); stepIndex++) {
+            FeatureSorter.StepFeatureData step = steps.get(stepIndex);
+            for (int featureIndex = 0; featureIndex < step.features().size(); featureIndex++) {
+                String id = idsByFeature.get(step.features().get(featureIndex));
+                if (id != null) locations.put(id, new FeatureLocation(stepIndex, featureIndex));
+            }
+        }
+        return locations;
+    }
+
+    private static Map<PlacedFeature, String> placedFeatureIds(HolderLookup.RegistryLookup<PlacedFeature> placedFeatures) {
+        Map<PlacedFeature, String> idsByFeature = new IdentityHashMap<>();
+        placedFeatures.listElements().forEach(holder ->
+            idsByFeature.put(holder.value(), holder.key().identifier().toString())
+        );
+        return idsByFeature;
+    }
+
+    private static BlockPos sampleOrigin(PlacementData placement, WorldgenRandom random, BlockPos chunkOrigin) {
+        if (placement.rarityChance() > 1 && random.nextFloat() >= 1.0f / placement.rarityChance()) return null;
+
+        int x = chunkOrigin.getX();
+        int z = chunkOrigin.getZ();
+        if (placement.inSquare()) {
+            x += random.nextInt(16);
+            z += random.nextInt(16);
+        }
+
+        int y = placement.sampleY(random);
+        return new BlockPos(x, y, z);
+    }
+
+    private static boolean shouldSkipAirCheck(WorldgenRandom random, float discardChanceOnAirExposure) {
+        if (discardChanceOnAirExposure <= 0.0f) return true;
+        if (discardChanceOnAirExposure >= 1.0f) return false;
+        return random.nextFloat() >= discardChanceOnAirExposure;
+    }
+
+    private static boolean shouldSkipAirCheckForReport(float discardChanceOnAirExposure) {
+        return discardChanceOnAirExposure <= 0.0f;
+    }
+
+    private static boolean isAdjacentToAir(SimulatedTerrain terrain, int x, int y, int z) {
+        return terrain.block(x + 1, y, z).isAir()
+            || terrain.block(x - 1, y, z).isAir()
+            || terrain.block(x, y + 1, z).isAir()
+            || terrain.block(x, y - 1, z).isAir()
+            || terrain.block(x, y, z + 1).isAir()
+            || terrain.block(x, y, z - 1).isAir();
+    }
+
+    private static void removeCoveredSpheres(double[] spheres, int size) {
+        for (int i = 0; i < size - 1; i++) {
+            if (spheres[i * 4 + 3] <= 0.0D) continue;
+            for (int j = i + 1; j < size; j++) {
+                if (spheres[j * 4 + 3] <= 0.0D) continue;
+
+                double dx = spheres[i * 4] - spheres[j * 4];
+                double dy = spheres[i * 4 + 1] - spheres[j * 4 + 1];
+                double dz = spheres[i * 4 + 2] - spheres[j * 4 + 2];
+                double dr = spheres[i * 4 + 3] - spheres[j * 4 + 3];
+                if (dr * dr <= dx * dx + dy * dy + dz * dz) continue;
+
+                if (dr > 0.0D) {
+                    spheres[j * 4 + 3] = -1.0D;
+                } else {
+                    spheres[i * 4 + 3] = -1.0D;
+                }
+            }
+        }
+    }
+
+    private static int scatteredOffset(WorldgenRandom random, int distance) {
+        return Math.round((random.nextFloat() - random.nextFloat()) * distance);
+    }
+
+    private static OreType oreTypeForState(BlockState state) {
+        for (OreType type : OreType.values()) {
+            if (type.matches(state)) return type;
+        }
+        return null;
+    }
+
+    private static boolean canReplaceTarget(OreFeatureSpec spec,
+                                            OreConfiguration.TargetBlockState targetState,
+                                            BlockState baseState,
+                                            WorldgenRandom random) {
+        if (targetState.target.test(baseState, random)) return true;
+        return isAncientDebrisFeature(spec) && isNetherBaseStone(baseState);
+    }
+
+    private static boolean isAncientDebrisFeature(OreFeatureSpec spec) {
+        return "minecraft:ore_ancient_debris_large".equals(spec.sourceId())
+            || "minecraft:ore_debris_small".equals(spec.sourceId());
+    }
+
+    private static boolean isNetherBaseStone(BlockState state) {
+        return state.is(Blocks.NETHERRACK)
+            || state.is(Blocks.BASALT)
+            || state.is(Blocks.BLACKSTONE);
+    }
+
+    private static String blockStateId(BlockState state) {
+        if (state == null) return "unknown";
+        return BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+    }
+
+    private static void increment(Map<String, Integer> counts, String key) {
+        counts.merge(key, 1, Integer::sum);
+    }
+
+    private static boolean specTargetsType(OreFeatureSpec spec, OreType oreType) {
+        for (OreConfiguration.TargetBlockState targetState : spec.targetStates()) {
+            if (oreType.matches(targetState.state)) return true;
+        }
+        return false;
+    }
+
+    private static List<String> allOreLikePlacedFeatureIds() {
+        return List.of(
+            "minecraft:ore_dirt",
+            "minecraft:ore_gravel",
+            "minecraft:ore_granite_lower",
+            "minecraft:ore_granite_upper",
+            "minecraft:ore_diorite_lower",
+            "minecraft:ore_diorite_upper",
+            "minecraft:ore_andesite_lower",
+            "minecraft:ore_andesite_upper",
+            "minecraft:ore_tuff",
+            "minecraft:ore_coal_upper",
+            "minecraft:ore_coal_lower",
+            "minecraft:ore_iron_upper",
+            "minecraft:ore_iron_middle",
+            "minecraft:ore_iron_small",
+            "minecraft:ore_copper",
+            "minecraft:ore_copper_large",
+            "minecraft:ore_gold",
+            "minecraft:ore_gold_lower",
+            "minecraft:ore_gold_extra",
+            "minecraft:ore_redstone",
+            "minecraft:ore_redstone_lower",
+            "minecraft:ore_diamond",
+            "minecraft:ore_diamond_large",
+            "minecraft:ore_diamond_buried",
+            "minecraft:ore_diamond_medium",
+            "minecraft:ore_lapis",
+            "minecraft:ore_lapis_buried",
+            "minecraft:ore_emerald",
+            "minecraft:ore_infested",
+            "minecraft:ore_clay",
+            "minecraft:ore_gravel_nether",
+            "minecraft:ore_blackstone",
+            "minecraft:ore_magma",
+            "minecraft:ore_soul_sand",
+            "minecraft:ore_quartz_nether",
+            "minecraft:ore_quartz_deltas",
+            "minecraft:ore_gold_nether",
+            "minecraft:ore_gold_deltas",
+            "minecraft:ore_ancient_debris_large",
+            "minecraft:ore_debris_small"
+        );
+    }
+
+    private static PlacementData placedFeatureData(String id, int dimension) {
+        // Vanilla VerticalAnchor.top() resolves to (build height - 1), i.e. the top placeable
+        // block, not the exclusive ceiling returned by topAnchor(). Using the inclusive value
+        // keeps the uniform Y sampling in step with vanilla for top()-anchored features.
+        int top = topAnchor(dimension) - 1;
+        int bottom = minBuildY(dimension);
+
+        return switch (id) {
+            case "minecraft:ore_dirt" -> PlacementData.count(7, HeightMode.UNIFORM, 0, 160);
+            case "minecraft:ore_gravel" -> PlacementData.count(14, HeightMode.UNIFORM, bottom, top);
+            case "minecraft:ore_granite_lower", "minecraft:ore_diorite_lower", "minecraft:ore_andesite_lower" -> PlacementData.count(2, HeightMode.UNIFORM, 0, 60);
+            case "minecraft:ore_granite_upper", "minecraft:ore_diorite_upper", "minecraft:ore_andesite_upper" -> PlacementData.rarity(6, HeightMode.UNIFORM, 64, 128);
+            case "minecraft:ore_tuff" -> PlacementData.count(2, HeightMode.UNIFORM, bottom, 0);
+            case "minecraft:ore_coal_upper" -> PlacementData.count(30, HeightMode.UNIFORM, 136, top);
+            case "minecraft:ore_coal_lower" -> PlacementData.count(20, HeightMode.TRAPEZOID, 0, 192);
+            case "minecraft:ore_iron_upper" -> PlacementData.count(90, HeightMode.TRAPEZOID, 80, 384);
+            case "minecraft:ore_iron_middle" -> PlacementData.count(10, HeightMode.TRAPEZOID, -24, 56);
+            case "minecraft:ore_iron_small" -> PlacementData.count(10, HeightMode.UNIFORM, -64, 72);
+            case "minecraft:ore_copper", "minecraft:ore_copper_large" -> PlacementData.count(16, HeightMode.TRAPEZOID, -16, 112);
+            case "minecraft:ore_gold" -> PlacementData.count(4, HeightMode.TRAPEZOID, -64, 32);
+            case "minecraft:ore_gold_lower" -> PlacementData.uniformCount(0, 1, HeightMode.UNIFORM, -64, -48);
+            case "minecraft:ore_gold_extra" -> PlacementData.count(50, HeightMode.UNIFORM, 32, 256);
+            case "minecraft:ore_redstone" -> PlacementData.count(4, HeightMode.UNIFORM, -64, 15);
+            case "minecraft:ore_redstone_lower" -> PlacementData.count(8, HeightMode.TRAPEZOID, -96, -32);
+            case "minecraft:ore_diamond" -> PlacementData.count(7, HeightMode.TRAPEZOID, -144, 16);
+            case "minecraft:ore_diamond_large" -> PlacementData.rarity(9, HeightMode.TRAPEZOID, -144, 16);
+            case "minecraft:ore_diamond_buried" -> PlacementData.count(4, HeightMode.TRAPEZOID, -144, 16);
+            case "minecraft:ore_diamond_medium" -> PlacementData.count(2, HeightMode.UNIFORM, -64, -4);
+            case "minecraft:ore_lapis" -> PlacementData.count(2, HeightMode.TRAPEZOID, -32, 32);
+            case "minecraft:ore_lapis_buried" -> PlacementData.count(4, HeightMode.UNIFORM, -64, 64);
+            case "minecraft:ore_emerald" -> PlacementData.count(100, HeightMode.TRAPEZOID, -16, 480);
+            case "minecraft:ore_infested" -> PlacementData.count(14, HeightMode.UNIFORM, bottom, 63);
+            case "minecraft:ore_clay" -> PlacementData.count(46, HeightMode.UNIFORM, bottom, 256);
+            case "minecraft:ore_gravel_nether" -> PlacementData.count(2, HeightMode.UNIFORM, 5, 41);
+            case "minecraft:ore_blackstone" -> PlacementData.count(2, HeightMode.UNIFORM, 5, 31);
+            case "minecraft:ore_magma" -> PlacementData.count(4, HeightMode.UNIFORM, 27, 36);
+            case "minecraft:ore_soul_sand" -> PlacementData.count(12, HeightMode.UNIFORM, 0, 31);
+            case "minecraft:ore_quartz_nether" -> PlacementData.count(16, HeightMode.UNIFORM, 10, 118);
+            case "minecraft:ore_quartz_deltas" -> PlacementData.count(32, HeightMode.UNIFORM, 10, 118);
+            case "minecraft:ore_gold_nether" -> PlacementData.count(10, HeightMode.UNIFORM, 10, 118);
+            case "minecraft:ore_gold_deltas" -> PlacementData.count(20, HeightMode.UNIFORM, 10, 118);
+            case "minecraft:ore_ancient_debris_large" -> PlacementData.count(1, HeightMode.TRAPEZOID, 8, 24);
+            case "minecraft:ore_debris_small" -> PlacementData.count(1, HeightMode.UNIFORM, 8, 118);
+            default -> null;
+        };
+    }
+
+    private static int minBuildY(int dimension) {
+        return dimension == -1 ? 0 : -64;
+    }
+
+    private static int topAnchor(int dimension) {
+        return dimension == -1 ? 128 : 320;
+    }
+
+    private record FeatureListKey(long seed, int dimension) {
+    }
+
+    private record ChunkOreKey(long seed, int dimension, int chunkX, int chunkZ) {
+    }
+
+    private record OreFeatureSpec(String sourceId, PlacedFeature placedFeature, int stepIndex, int featureIndex, PlacementData placement, List<OreConfiguration.TargetBlockState> targetStates, int size, float discardChanceOnAirExposure, boolean scattered) {
+    }
+
+    private record FeatureLocation(int stepIndex, int featureIndex) {
+    }
+
+    private enum HeightMode {
+        UNIFORM,
+        TRAPEZOID
+    }
+
+    private record PlacementData(int minCount, int maxCount, int rarityChance, boolean inSquare, HeightMode heightMode, int minY, int maxY) {
+        static PlacementData count(int count, HeightMode heightMode, int minY, int maxY) {
+            return new PlacementData(count, count, 1, true, heightMode, minY, maxY);
+        }
+
+        static PlacementData uniformCount(int minCount, int maxCount, HeightMode heightMode, int minY, int maxY) {
+            return new PlacementData(minCount, maxCount, 1, true, heightMode, minY, maxY);
+        }
+
+        static PlacementData rarity(int chance, HeightMode heightMode, int minY, int maxY) {
+            return new PlacementData(1, 1, chance, true, heightMode, minY, maxY);
+        }
+
+        int sampleCount(WorldgenRandom random) {
+            if (minCount == maxCount) return minCount;
+            return Mth.randomBetweenInclusive(random, minCount, maxCount);
+        }
+
+        int sampleY(WorldgenRandom random) {
+            int min = minY;
+            int max = maxY;
+            if (min > max) return min;
+
+            if (heightMode == HeightMode.UNIFORM) {
+                return Mth.randomBetweenInclusive(random, min, max);
+            }
+
+            int range = max - min;
+            int lower = range / 2;
+            int upper = range - lower;
+            return min + Mth.randomBetweenInclusive(random, 0, upper) + Mth.randomBetweenInclusive(random, 0, lower);
+        }
+    }
+
+    private static final class SimulatedTerrain {
+        private final WorldgenEngine.TerrainAccessor base;
+        private final int minY;
+        private final int maxY;
+        private final Map<Long, BlockState> overrides = new HashMap<>();
+
+        private SimulatedTerrain(WorldgenEngine.TerrainAccessor base, int dimension) {
+            this.base = base;
+            this.minY = minBuildY(dimension);
+            this.maxY = topAnchor(dimension) - 1;
+        }
+
+        private boolean isInsideBuildHeight(int y) {
+            return y >= minY && y <= maxY;
+        }
+
+        private BlockState block(int blockX, int blockY, int blockZ) {
+            if (!isInsideBuildHeight(blockY)) return Blocks.AIR.defaultBlockState();
+            BlockState override = overrides.get(BlockPos.asLong(blockX, blockY, blockZ));
+            return override != null ? override : base.block(blockX, blockY, blockZ);
+        }
+
+        private void setBlock(int blockX, int blockY, int blockZ, BlockState state) {
+            if (!isInsideBuildHeight(blockY)) return;
+            overrides.put(BlockPos.asLong(blockX, blockY, blockZ), state);
+        }
+
+        private int oceanFloorHeight(int blockX, int blockZ) {
+            return base.oceanFloorHeight(blockX, blockZ);
+        }
     }
 }

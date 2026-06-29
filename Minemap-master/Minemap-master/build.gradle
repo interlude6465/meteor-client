@@ -1,0 +1,334 @@
+buildscript {
+    repositories {
+        mavenLocal()
+        mavenCentral()
+        google()
+    }
+    dependencies {
+        classpath 'com.guardsquare:proguard-gradle:7.2.2'
+    }
+}
+plugins {
+    id 'java'
+    id "application"
+    id 'signing'
+    id "com.github.johnrengelman.shadow" version "7.1.2"
+    id 'edu.sc.seis.launch4j' version '2.5.3'
+    id 'org.gradle.crypto.checksum' version '1.4.0'
+}
+
+
+defaultTasks("clean", "release")
+
+java {
+    // very important ByteBuffer does not have flip in java 1.8
+    // this set the javac --release flag
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(8))
+    }
+}
+
+repositories {
+    mavenCentral()
+    google()
+    maven {
+        url "https://jitpack.io"
+    }
+    maven {
+        url "https://maven.latticg.com/"
+    }
+    maven {
+        url "https://maven.seedfinding.com/"
+    }
+    maven {
+        url "https://maven-snapshots.seedfinding.com/"
+    }
+    maven {
+        url "https://oss.sonatype.org/content/repositories/snapshots"
+    }
+}
+
+
+import org.apache.tools.ant.filters.ReplaceTokens
+import org.gradle.crypto.checksum.Checksum
+import proguard.gradle.ProGuardTask
+
+// this task replace the @VERSION@ token with the current project.version
+task processSource(type: Sync) {
+    from sourceSets.main.java
+    inputs.property 'version', version
+    filter(ReplaceTokens, tokens: [VERSION: version])
+    into "$buildDir/src"
+}
+
+compileJava {
+    source = processSource.outputs
+}
+
+tasks.withType(JavaCompile) {
+    options.compilerArgs += ['-Xlint:deprecation', '-Xlint:unchecked']
+    options.fork = true
+}
+
+run {
+    args "--no-update"
+}
+
+dependencies {
+    implementation('com.seedfinding:mc_math:1.171.0') { transitive = false }
+    implementation('com.seedfinding:mc_seed:1.171.1') { transitive = false }
+    implementation('com.seedfinding:mc_core:1.192.1') { transitive = false }
+    implementation('com.seedfinding:mc_noise:1.171.1') { transitive = false }
+
+    implementation('com.seedfinding:mc_biome:1.171.1') { transitive = false }
+    implementation('com.seedfinding:mc_terrain:1.171.1') { transitive = false }
+    implementation('com.seedfinding:mc_feature:1.171.1') { transitive = false }
+
+
+    testImplementation('com.seedfinding:mc_reversal:1.171.1') { transitive = false }
+
+    implementation('com.seedfinding:latticg:1.06')
+
+    implementation('com.google.code.gson:gson:2.9.0')
+    implementation('com.formdev:flatlaf:2.4')
+    implementation("com.formdev:flatlaf-intellij-themes:2.4")
+    implementation('org.swinglabs.swingx:swingx-core:1.6.5-1')
+    implementation('org.pushing-pixels:radiance-trident:3.5.1')
+    implementation('one.util:streamex:0.8.1')
+    implementation('com.vdurmont:semver4j:3.1.0')
+    // JOML
+    implementation 'org.joml:joml:1.10.4'
+    // LWJGL core
+    implementation "org.lwjgl:lwjgl:${lwjglVersion}"
+    // LWJGL natives
+    runtimeOnly "org.lwjgl:lwjgl:${lwjglVersion}:natives-windows"
+    runtimeOnly "org.lwjgl:lwjgl:${lwjglVersion}:natives-linux"
+    runtimeOnly "org.lwjgl:lwjgl:${lwjglVersion}:natives-macos"
+    // OPENGL
+    implementation "org.lwjgl:lwjgl-opengl:${lwjglVersion}"
+    // OPENGL NATIVES
+    runtimeOnly "org.lwjgl:lwjgl-opengl:${lwjglVersion}:natives-windows"
+    runtimeOnly "org.lwjgl:lwjgl-opengl:${lwjglVersion}:natives-linux"
+    runtimeOnly "org.lwjgl:lwjgl-opengl:${lwjglVersion}:natives-macos"
+    // GLFW
+    implementation "org.lwjgl:lwjgl-glfw:${lwjglVersion}"
+    // GLFW NATIVES
+    runtimeOnly "org.lwjgl:lwjgl-glfw:${lwjglVersion}:natives-windows"
+    runtimeOnly "org.lwjgl:lwjgl-glfw:${lwjglVersion}:natives-linux"
+    runtimeOnly "org.lwjgl:lwjgl-glfw:${lwjglVersion}:natives-macos"
+    // STB
+    implementation "org.lwjgl:lwjgl-stb:${lwjglVersion}"
+    // STB NATIVES
+    runtimeOnly "org.lwjgl:lwjgl-stb:${lwjglVersion}:natives-windows"
+    runtimeOnly "org.lwjgl:lwjgl-stb:${lwjglVersion}:natives-linux"
+    runtimeOnly "org.lwjgl:lwjgl-stb:${lwjglVersion}:natives-macos"
+}
+
+application {
+    mainClass.set("com.seedfinding.minemap.MineMap")
+}
+
+shadowJar {
+    archiveFileName = "${project.name}-${project.version}.jar"
+}
+
+launch4j {
+    outfile = "${project.name}-${project.version}.exe"
+    icon = "${projectDir}/icon.ico"
+    outputDir = "libs"
+    supportUrl = "https://github.com/hube12/MineMap/issues"
+    jvmOptions = ["-Xms1G", "-Xmx8G"]
+    initialHeapPercent = 5
+    maxHeapPercent = 80
+    jarTask = project.tasks.shadowJar
+    productName = "MineMap"
+    fileDescription = "A lightning fast map viewer for Minecraft."
+    copyConfigurable = [] // don't copy lib
+    libraryDir = "ignore_libs"
+    jreMaxVersion = JavaVersion.VERSION_HIGHER
+    jreMinVersion = JavaVersion.VERSION_1_8
+    // this is a dirty fix to use JAVA_HOME
+    bundledJrePath = "%JAVA_HOME%;%PATH%"
+}
+
+signing {
+    if (signing.getSignatory() == null) {
+        System.err.println("Missing configuration driven signing key, defaulting to in memory.")
+        def signingKeyId = findProperty("signingKeyId")
+        def signingKey = findProperty("signingKey")
+        def signingPassword = findProperty("signingPassword")
+        if (signingKey == null || signingKey == null || signingPassword == null) {
+            System.err.println("Missing in memory signing key, defaulting to agent.")
+            useGpgCmd()
+        } else {
+            useInMemoryPgpKeys(signingKeyId, signingKey, signingPassword)
+        }
+    }
+    gradle.taskGraph.whenReady { taskGraph ->
+        tasks.findAll { t ->
+            if (t.name == "signShadowJar") {
+                if (t.enabled) {
+                    t.doLast {
+                        println "Signing jar was a success, congrats !"
+                    }
+                }
+            }
+        }
+    }
+    sign shadowJar
+}
+
+// Because launch4j doesn't stay in its lane and modify my precious jar
+signShadowJar {
+    dependsOn createExe
+}
+
+task createChecksums(type: Checksum, dependsOn: [shadowJar, signShadowJar, createExe]) {
+    inputFiles.setFrom(layout.buildDirectory.dir("libs"))
+    outputDirectory.set(layout.buildDirectory.dir("libs"))
+    checksumAlgorithm.set(Checksum.Algorithm.SHA512)
+    appendFileNameToChecksum.set(true)
+}
+
+task releaseZip(type: Zip, dependsOn: createChecksums) {
+    setArchivesBaseName("Minemap")
+    destinationDirectory.set(new File("${buildDir}/release"))
+    println("Saving to: " + destinationDirectory.get())
+    from "${buildDir}/libs"
+}
+
+signing {
+    if (signing.getSignatory() == null) {
+        System.err.println("Missing configuration driven signing key, defaulting to in memory.")
+        def signingKeyId = findProperty("signingKeyId")
+        def signingKey = findProperty("signingKey")
+        def signingPassword = findProperty("signingPassword")
+        if (signingKey == null || signingKey == null || signingPassword == null) {
+            System.err.println("Missing in memory signing key, defaulting to agent.")
+            useGpgCmd()
+        } else {
+            useInMemoryPgpKeys(signingKeyId, signingKey, signingPassword)
+        }
+    }
+    gradle.taskGraph.whenReady { taskGraph ->
+        tasks.findAll { t ->
+            if (t.name == "signReleaseZip") {
+                if (t.enabled) {
+                    t.doLast {
+                        println "Signing zip was a success, congrats !"
+                    }
+                }
+            }
+        }
+    }
+    sign releaseZip
+}
+
+task("release") {
+    dependsOn(clean)
+    dependsOn(shadowJar)
+    dependsOn(createExe)
+    dependsOn(signShadowJar)
+    dependsOn(createChecksums)
+    dependsOn(signReleaseZip)
+}
+
+task proguard(type: ProGuardTask) {
+
+    // You should probably import a more compact ProGuard-style configuration
+    // file for all static settings, but we're specifying them all here, for
+    // the sake of the example.
+    //configuration 'configuration.pro'
+
+    verbose
+
+    // Specify the input jars, output jars, and library jars.
+
+    injars "build/libs/${project.name}-${project.version}.jar"
+    outjars 'out.jar'
+
+    // Automatically handle the Java version of this build.
+    if (System.getProperty('java.version').startsWith('1.')) {
+        // Before Java 9, the runtime classes were packaged in a single jar file.
+        libraryjars "${System.getProperty('java.home')}/lib/rt.jar"
+    } else {
+        // As of Java 9, the runtime classes are packaged in modular jmod files.
+        libraryjars "${System.getProperty('java.home')}/jmods/java.base.jmod", jarfilter: '!**.jar', filter: '!module-info.class'
+        libraryjars "${System.getProperty('java.home')}/jmods/java.desktop.jmod", jarfilter: '!**.jar', filter: '!module-info.class'
+        libraryjars "${System.getProperty('java.home')}/jmods/java.logging.jmod", jarfilter: '!**.jar', filter: '!module-info.class'
+        libraryjars "${System.getProperty('java.home')}/jmods/java.sql.jmod", jarfilter: '!**.jar', filter: '!module-info.class'
+        libraryjars "${System.getProperty('java.home')}/jmods/java.management.jmod", jarfilter: '!**.jar', filter: '!module-info.class'
+        libraryjars "${System.getProperty('java.home')}/jmods/java.datatransfer.jmod", jarfilter: '!**.jar', filter: '!module-info.class'
+        libraryjars "${System.getProperty('java.home')}/jmods/java.prefs.jmod", jarfilter: '!**.jar', filter: '!module-info.class'
+        libraryjars "${System.getProperty('java.home')}/jmods/java.naming.jmod", jarfilter: '!**.jar', filter: '!module-info.class'
+        //libraryjars "${System.getProperty('java.home')}/jmods/....."
+    }
+
+    //libraryjars 'junit.jar'
+    //libraryjars 'servlet.jar'
+    //libraryjars 'jai_core.jar'
+    //...
+
+    // Save the obfuscation mapping to a file, so you can de-obfuscate any stack
+    // traces later on. Keep a fixed source file attribute and all line number
+    // tables to get line numbers in the stack traces.
+    // You can comment this out if you're not interested in stack traces.
+
+    printmapping 'out.map'
+    renamesourcefileattribute 'SourceFile'
+    keepattributes 'SourceFile,LineNumberTable'
+
+    // Preserve all annotations.
+
+    keepattributes '*Annotation*'
+
+    // You can print out the seeds that are matching the keep options below.
+
+    //printseeds 'out.seeds'
+
+    // Preserve all public applications.
+
+    keepclasseswithmembers 'public class * { \
+        public static void main(java.lang.String[]); \
+    }'
+
+    // Preserve all native method names and the names of their classes.
+
+    keepclasseswithmembernames includedescriptorclasses: true, 'class * { \
+        native <methods>; \
+    }'
+
+    // Preserve the special static methods that are required in all enumeration
+    // classes.
+
+    keepclassmembers allowoptimization: true, 'enum * { \
+        public static **[] values(); \
+        public static ** valueOf(java.lang.String); \
+    }'
+
+    // Explicitly preserve all serialization members. The Serializable interface
+    // is only a marker interface, so it wouldn't save them.
+    // You can comment this out if your application doesn't use serialization.
+    // If your code contains serializable classes that have to be backward
+    // compatible, please refer to the manual.
+
+    keepclassmembers 'class * implements java.io.Serializable { \
+        static final long serialVersionUID; \
+        static final java.io.ObjectStreamField[] serialPersistentFields; \
+        private void writeObject(java.io.ObjectOutputStream); \
+        private void readObject(java.io.ObjectInputStream); \
+        java.lang.Object writeReplace(); \
+        java.lang.Object readResolve(); \
+    }'
+
+    // Your application may contain more items that need to be preserved;
+    // typically classes that are dynamically created using Class.forName:
+    keep 'class org.jetbrains.annotations.** { *; }'
+    dontwarn 'org.jetbrains.annotations.**'
+    dontwarn "sun.misc.Unsafe"
+    dontwarn "javax.annotation.**"
+    dontwarn "org.lwjgl.vulkan.**"
+    // keep 'public class com.example.MyClass'
+    // keep 'public interface com.example.MyInterface'
+    // keep 'public class * implements com.example.MyInterface'
+}

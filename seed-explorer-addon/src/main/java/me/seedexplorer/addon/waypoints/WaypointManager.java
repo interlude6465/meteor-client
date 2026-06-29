@@ -121,6 +121,44 @@ public class WaypointManager {
     }
 
     /**
+     * Removes a waypoint at the exact seed-explorer structure position.
+     *
+     * @param x         Block X coordinate
+     * @param z         Block Z coordinate
+     * @param dimension 0=Overworld, -1=Nether, 1=End
+     * @return true if a matching waypoint was removed
+     */
+    public boolean removeWaypointAt(int x, int z, int dimension) {
+        boolean removed = false;
+
+        for (SeedWaypoint sw : new ArrayList<>(seedWaypoints)) {
+            if (sw.x == x && sw.z == z && sw.dimension == dimension) {
+                removed |= removeWaypoint(sw);
+            }
+        }
+
+        Waypoints waypoints = Waypoints.get();
+        List<Waypoint> meteorWaypoints = new ArrayList<>();
+        for (Waypoint wp : waypoints) {
+            meteorWaypoints.add(wp);
+        }
+
+        for (Waypoint wp : meteorWaypoints) {
+            BlockPos pos = wp.pos.get();
+            int wpDim = switch (wp.dimension.get()) {
+                case Overworld -> 0;
+                case Nether -> -1;
+                case End -> 1;
+            };
+            if (pos.getX() == x && pos.getZ() == z && wpDim == dimension) {
+                removed |= waypoints.remove(wp);
+            }
+        }
+
+        return removed;
+    }
+
+    /**
      * Removes a Meteor Client waypoint and its corresponding seed waypoint.
      *
      * @param waypoint The Meteor Client waypoint to remove

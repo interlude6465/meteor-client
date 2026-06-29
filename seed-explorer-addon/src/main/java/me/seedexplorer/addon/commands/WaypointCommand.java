@@ -22,7 +22,9 @@ import me.seedexplorer.addon.waypoints.SeedWaypoint;
 import me.seedexplorer.addon.waypoints.WaypointManager;
 
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
 
 public class WaypointCommand extends Command {
     public WaypointCommand() {
@@ -151,29 +153,25 @@ public class WaypointCommand extends Command {
                     BlockPos playerPos = mc.player.blockPosition();
                     int dimension = getCurrentDimension();
 
-                    // Convert block position to structure region coordinates
+                    // Scan a square of 32-chunk (512-block) regions around the player.
+                    int playerRegionX = Math.floorDiv(playerPos.getX(), 512);
+                    int playerRegionZ = Math.floorDiv(playerPos.getZ(), 512);
+
+                    List<GeneratedStructure> structures = StructurePredictor.predict(
+                        playerRegionX - radius, playerRegionZ - radius,
+                        playerRegionX + radius, playerRegionZ + radius, dimension);
+
+                    // Group predictions by their actual type so each waypoint is labelled correctly.
+                    Map<StructureType, List<int[]>> coordsByType = new EnumMap<>(StructureType.class);
+                    for (GeneratedStructure gs : structures) {
+                        coordsByType.computeIfAbsent(gs.type, k -> new ArrayList<>()).add(new int[]{gs.x, gs.z});
+                    }
+
                     int count = 0;
-                    for (StructureType type : StructureType.values()) {
-                        if (type.dimension != dimension) continue;
-
-                        int regionSize = type.regionSize * 16;
-                        int playerRegionX = Math.floorDiv(playerPos.getX(), regionSize);
-                        int playerRegionZ = Math.floorDiv(playerPos.getZ(), regionSize);
-
-                        int rMinX = playerRegionX - radius;
-                        int rMinZ = playerRegionZ - radius;
-                        int rMaxX = playerRegionX + radius;
-                        int rMaxZ = playerRegionZ + radius;
-
-                        List<GeneratedStructure> structures = StructurePredictor.predict(rMinX, rMinZ, rMaxX, rMaxZ, dimension);
-                        List<int[]> coordinates = new ArrayList<>();
-                        for (GeneratedStructure gs : structures) {
-                            coordinates.add(new int[]{gs.x, gs.z});
-                        }
-
-                        String icon = getIconForType(type);
+                    for (Map.Entry<StructureType, List<int[]>> entry : coordsByType.entrySet()) {
+                        StructureType type = entry.getKey();
                         count += WaypointManager.get().createWaypointsBulk(
-                            type.displayName, coordinates, dimension, icon, type.displayName
+                            type.displayName, entry.getValue(), dimension, getIconForType(type), type.displayName
                         );
                     }
 

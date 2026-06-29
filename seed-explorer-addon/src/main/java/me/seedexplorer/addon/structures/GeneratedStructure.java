@@ -12,16 +12,34 @@ package me.seedexplorer.addon.structures;
 public class GeneratedStructure {
     public final int x, z;
     public final StructureType type;
+    public final String variant;
+    public final boolean hasShip;
     public boolean verified;
 
     public GeneratedStructure(int x, int z, StructureType type) {
+        this(x, z, type, "", false);
+    }
+
+    public GeneratedStructure(int x, int z, StructureType type, String variant) {
+        this(x, z, type, variant, false);
+    }
+
+    public GeneratedStructure(int x, int z, StructureType type, String variant, boolean hasShip) {
         this.x = x;
         this.z = z;
         this.type = type;
+        this.variant = variant == null ? "" : variant;
+        this.hasShip = hasShip;
         this.verified = false;
     }
 
     public String getCoordsString() {
         return x + ", " + z;
+    }
+
+    public String displayName() {
+        if (type == StructureType.END_CITY && hasShip) return type.displayName + " (Ship)";
+        if (!variant.isBlank()) return type.displayName + " (" + variant + ")";
+        return type.displayName;
     }
 }
