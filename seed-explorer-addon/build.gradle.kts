@@ -39,6 +39,7 @@ dependencies {
     val brigadierJar = cachedJar("com.mojang", "brigadier", "1.3.10")
     val orbitJar = cachedJar("meteordevelopment", "orbit", "0.2.4")
     val fabricLoaderJar = cachedJar("net.fabricmc", "fabric-loader", "0.19.2")
+    val mixinJar = cachedJar("net.fabricmc", "sponge-mixin", "0.17.2+mixin.0.8.7")
     val jspecifyJar = cachedJar("org.jspecify", "jspecify", "1.0.0")
     val fastutilJar = cachedJar("it.unimi.dsi", "fastutil", "8.5.18")
     val gsonJar = cachedJar("com.google.code.gson", "gson", "2.13.2")
@@ -62,7 +63,7 @@ dependencies {
 
     compileOnly(files(
         meteorClientClasses, meteorClientResources, minecraftMergedJar, brigadierJar, orbitJar, fabricLoaderJar,
-        jspecifyJar, fastutilJar, gsonJar, guavaJar, failureAccessJar, commonsLang3Jar,
+        mixinJar, jspecifyJar, fastutilJar, gsonJar, guavaJar, failureAccessJar, commonsLang3Jar,
         log4jApiJar, log4jCoreJar, slf4jJar, datafixerupperJar, jomlJar,
         icu4jJar, authlibJar, mojangLoggingJar,
         nettyCommonJar, nettyBufferJar, nettyTransportJar, nettyResolverJar, nettyCodecBaseJar, nettyHandlerJar

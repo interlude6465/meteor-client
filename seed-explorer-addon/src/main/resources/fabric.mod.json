@@ -17,6 +17,9 @@
       "me.seedexplorer.addon.SeedExplorerAddon"
     ]
   },
+  "mixins": [
+    "meteor-seed-explorer.mixins.json"
+  ],
   "custom": {
     "meteor-client:color": "45,180,90",
     "meteor-client:commit": ""

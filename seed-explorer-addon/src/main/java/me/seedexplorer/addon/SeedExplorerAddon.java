@@ -5,6 +5,7 @@
 
 package me.seedexplorer.addon;
 
+import me.seedexplorer.addon.commands.PredictedMineChatBridge;
 import me.seedexplorer.addon.commands.SeedCommand;
 import me.seedexplorer.addon.commands.SeedExplorerCommand;
 import me.seedexplorer.addon.commands.WaypointCommand;
@@ -32,9 +33,11 @@ public class SeedExplorerAddon extends MeteorAddon {
         Modules.get().add(new SeedExplorerModule());
 
         // Register commands
-        Commands.add(new SeedExplorerCommand());
+        SeedExplorerCommand seedExplorerCommand = new SeedExplorerCommand();
+        Commands.add(seedExplorerCommand);
         Commands.add(new SeedCommand());
         Commands.add(new WaypointCommand());
+        new PredictedMineChatBridge(seedExplorerCommand);
     }
 
     @Override

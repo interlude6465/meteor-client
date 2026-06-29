@@ -1,0 +1,11 @@
+{
+  "required": true,
+  "package": "me.seedexplorer.addon.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "ClientPacketListenerPredictedMineMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

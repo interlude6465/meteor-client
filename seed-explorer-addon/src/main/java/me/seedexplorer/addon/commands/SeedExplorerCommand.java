@@ -6,6 +6,7 @@
 package me.seedexplorer.addon.commands;
 
 import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import me.seedexplorer.addon.map.BiomeGenerator;
 import me.seedexplorer.addon.ore.OrePatch;
@@ -25,10 +26,12 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.block.state.BlockState;
 
+import java.lang.reflect.Array;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -205,6 +208,29 @@ public class SeedExplorerCommand extends Command {
             )
         );
 
+        builder.then(literal("mine-predicted")
+            .then(literal("stop")
+                .executes(context -> stopBaritonePathing())
+            )
+            .then(argument("ore", StringArgumentType.word())
+                .executes(context -> runMinePredicted(StringArgumentType.getString(context, "ore"), 8, 24))
+                .then(argument("radius", IntegerArgumentType.integer(1, 12))
+                    .executes(context -> runMinePredicted(
+                        StringArgumentType.getString(context, "ore"),
+                        IntegerArgumentType.getInteger(context, "radius"),
+                        24
+                    ))
+                    .then(argument("targets", IntegerArgumentType.integer(1, 64))
+                        .executes(context -> runMinePredicted(
+                            StringArgumentType.getString(context, "ore"),
+                            IntegerArgumentType.getInteger(context, "radius"),
+                            IntegerArgumentType.getInteger(context, "targets")
+                        ))
+                    )
+                )
+            )
+        );
+
         builder.then(literal("locate-batch")
             .executes(context -> runLocateBatch())
             .then(literal("stop")
@@ -259,6 +285,185 @@ public class SeedExplorerCommand extends Command {
         }
 
         OreDebugRunner.get().start(radiusChunks);
+        return SINGLE_SUCCESS;
+    }
+
+    public int runMinePredictedFromChat(String oreName, int radiusChunks, int targetLimit) {
+        return runMinePredicted(oreName, radiusChunks, targetLimit);
+    }
+
+    private int runMinePredicted(String oreName, int radiusChunks, int targetLimit) {
+        if (mc.player == null || mc.level == null) {
+            error("Join a world first.");
+            return SINGLE_SUCCESS;
+        }
+
+        long seed = SeedManager.get().getWorldSeed();
+        if (seed == 0) {
+            error("No seed set. Use .seed set <seed> or the Seed Explorer seed box first.");
+            return SINGLE_SUCCESS;
+        }
+
+        OreType oreType = parseOreType(oreName);
+        if (oreType == null) {
+            error("Unknown ore '%s'. Try diamond, ancient_debris, quartz, nether_gold, iron, gold, redstone, lapis, coal, copper, or emerald.", oreName);
+            return SINGLE_SUCCESS;
+        }
+
+        int dimension = dimensionId();
+        if (oreType.dimension != dimension) {
+            error("%s prediction is for the %s, but you are in the %s.",
+                oreType.displayName,
+                dimensionName(oreType.dimension),
+                dimensionName(dimension));
+            return SINGLE_SUCCESS;
+        }
+
+        BlockPos playerPos = mc.player.blockPosition();
+        int radius = Math.max(1, Math.min(radiusChunks, 12));
+        int maxTargets = Math.max(1, Math.min(targetLimit, 64));
+        List<OrePatch> candidates = OrePredictor.predictInChunkRadius(
+            Math.floorDiv(playerPos.getX(), 16),
+            Math.floorDiv(playerPos.getZ(), 16),
+            radius,
+            dimension,
+            oreType,
+            maxTargets * 3,
+            playerPos.getX(),
+            playerPos.getY(),
+            playerPos.getZ(),
+            seed
+        );
+
+        List<OrePatch> targets = filterMineTargets(candidates, dimension, maxTargets);
+        if (targets.isEmpty()) {
+            warning("No uncleared predicted %s blocks found within %d chunks.", oreType.displayName, radius);
+            return SINGLE_SUCCESS;
+        }
+
+        BaritoneResult result = startBaritonePathing(targets);
+        if (!result.success()) {
+            error(result.message());
+            return SINGLE_SUCCESS;
+        }
+
+        OrePatch first = targets.getFirst();
+        info("Baritone pathing to predicted %s: %d target%s, closest at %d, %d, %d.",
+            oreType.displayName,
+            targets.size(),
+            targets.size() == 1 ? "" : "s",
+            first.x,
+            first.y,
+            first.z);
+        return SINGLE_SUCCESS;
+    }
+
+    private List<OrePatch> filterMineTargets(List<OrePatch> candidates, int dimension, int maxTargets) {
+        List<OrePatch> targets = new ArrayList<>();
+        Set<Long> seen = new HashSet<>();
+        for (OrePatch patch : candidates) {
+            if (SeedManager.get().isClearedOre(patch, dimension)) continue;
+
+            long key = BlockPos.asLong(patch.x, patch.y, patch.z);
+            if (!seen.add(key)) continue;
+
+            targets.add(patch);
+            if (targets.size() >= maxTargets) break;
+        }
+        return targets;
+    }
+
+    private OreType parseOreType(String oreName) {
+        String normalized = oreName.toLowerCase(Locale.ROOT)
+            .replace("minecraft:", "")
+            .replace("-", "_")
+            .replace(" ", "_");
+        if (normalized.endsWith("_ore")) normalized = normalized.substring(0, normalized.length() - 4);
+        if (normalized.endsWith("_ores")) normalized = normalized.substring(0, normalized.length() - 5);
+
+        return switch (normalized) {
+            case "diamond", "diamonds" -> OreType.DIAMOND;
+            case "emerald", "emeralds" -> OreType.EMERALD;
+            case "coal" -> OreType.COAL;
+            case "iron" -> OreType.IRON;
+            case "copper" -> OreType.COPPER;
+            case "gold" -> OreType.GOLD;
+            case "lapis", "lapis_lazuli" -> OreType.LAPIS;
+            case "redstone" -> OreType.REDSTONE;
+            case "quartz", "nether_quartz" -> OreType.QUARTZ;
+            case "nether_gold", "nethergold" -> OreType.NETHER_GOLD;
+            case "ancient_debris", "debris" -> OreType.ANCIENT_DEBRIS;
+            default -> null;
+        };
+    }
+
+    private BaritoneResult startBaritonePathing(List<OrePatch> targets) {
+        try {
+            Class<?> apiClass = Class.forName("baritone.api.BaritoneAPI");
+            Class<?> providerClass = Class.forName("baritone.api.IBaritoneProvider");
+            Class<?> baritoneClass = Class.forName("baritone.api.IBaritone");
+            Class<?> goalClass = Class.forName("baritone.api.pathing.goals.Goal");
+            Class<?> getToBlockGoalClass = Class.forName("baritone.api.pathing.goals.GoalGetToBlock");
+            Class<?> compositeGoalClass = Class.forName("baritone.api.pathing.goals.GoalComposite");
+            Class<?> customGoalProcessClass = Class.forName("baritone.api.process.ICustomGoalProcess");
+
+            Object provider = apiClass.getMethod("getProvider").invoke(null);
+            if (provider == null) return new BaritoneResult(false, "Baritone is not available.");
+
+            Object baritone = providerClass.getMethod("getPrimaryBaritone").invoke(provider);
+            if (baritone == null) return new BaritoneResult(false, "Baritone is not available.");
+
+            Object goal = createBaritoneGoal(targets, goalClass, getToBlockGoalClass, compositeGoalClass);
+            Object customGoalProcess = baritoneClass.getMethod("getCustomGoalProcess").invoke(baritone);
+            customGoalProcessClass.getMethod("setGoalAndPath", goalClass).invoke(customGoalProcess, goal);
+            return new BaritoneResult(true, "started");
+        } catch (ClassNotFoundException | NoClassDefFoundError ignored) {
+            return new BaritoneResult(false, "Baritone is not installed or not loaded.");
+        } catch (ReflectiveOperationException exception) {
+            Throwable cause = exception.getCause() == null ? exception : exception.getCause();
+            return new BaritoneResult(false, "Could not start Baritone pathing: " + cause.getClass().getSimpleName() + ": " + cause.getMessage());
+        } catch (Throwable throwable) {
+            return new BaritoneResult(false, "Could not start Baritone pathing: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+        }
+    }
+
+    private Object createBaritoneGoal(List<OrePatch> targets, Class<?> goalClass, Class<?> getToBlockGoalClass, Class<?> compositeGoalClass)
+        throws ReflectiveOperationException {
+        if (targets.size() == 1) {
+            OrePatch patch = targets.getFirst();
+            return getToBlockGoalClass.getConstructor(BlockPos.class).newInstance(new BlockPos(patch.x, patch.y, patch.z));
+        }
+
+        Object goalArray = Array.newInstance(goalClass, targets.size());
+        for (int i = 0; i < targets.size(); i++) {
+            OrePatch patch = targets.get(i);
+            Object goal = getToBlockGoalClass.getConstructor(BlockPos.class).newInstance(new BlockPos(patch.x, patch.y, patch.z));
+            Array.set(goalArray, i, goal);
+        }
+
+        return compositeGoalClass.getConstructor(goalArray.getClass()).newInstance(new Object[] { goalArray });
+    }
+
+    private int stopBaritonePathing() {
+        try {
+            Class<?> apiClass = Class.forName("baritone.api.BaritoneAPI");
+            Class<?> providerClass = Class.forName("baritone.api.IBaritoneProvider");
+            Class<?> baritoneClass = Class.forName("baritone.api.IBaritone");
+            Class<?> pathingBehaviorClass = Class.forName("baritone.api.behavior.IPathingBehavior");
+
+            Object provider = apiClass.getMethod("getProvider").invoke(null);
+            Object baritone = providerClass.getMethod("getPrimaryBaritone").invoke(provider);
+            Object pathingBehavior = baritoneClass.getMethod("getPathingBehavior").invoke(baritone);
+            pathingBehaviorClass.getMethod("cancelEverything").invoke(pathingBehavior);
+            info("Stopped Baritone pathing.");
+        } catch (ClassNotFoundException | NoClassDefFoundError ignored) {
+            error("Baritone is not installed or not loaded.");
+        } catch (ReflectiveOperationException exception) {
+            Throwable cause = exception.getCause() == null ? exception : exception.getCause();
+            error("Could not stop Baritone: %s: %s", cause.getClass().getSimpleName(), cause.getMessage());
+        } catch (Throwable throwable) {
+            error("Could not stop Baritone: %s: %s", throwable.getClass().getSimpleName(), throwable.getMessage());
+        }
         return SINGLE_SUCCESS;
     }
 
@@ -609,5 +814,8 @@ public class SeedExplorerCommand extends Command {
     }
 
     private record MatchSummary(int matchedActual, List<OrePatch> matchedPredicted, List<OrePatch> missingActual, List<OrePatch> extraPredicted) {
+    }
+
+    private record BaritoneResult(boolean success, String message) {
     }
 }
