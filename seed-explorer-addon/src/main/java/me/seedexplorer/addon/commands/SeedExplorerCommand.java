@@ -292,6 +292,10 @@ public class SeedExplorerCommand extends Command {
         return runMinePredicted(oreName, radiusChunks, targetLimit);
     }
 
+    public int stopMinePredictedFromChat() {
+        return stopBaritonePathing();
+    }
+
     private int runMinePredicted(String oreName, int radiusChunks, int targetLimit) {
         if (mc.player == null || mc.level == null) {
             error("Join a world first.");

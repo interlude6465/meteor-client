@@ -38,6 +38,11 @@ public final class PredictedMineChatBridge {
             return true;
         }
 
+        if ("stop".equalsIgnoreCase(parts[2])) {
+            activeCommand.stopMinePredictedFromChat();
+            return true;
+        }
+
         int radius = parseInt(parts, 3, 8);
         int targets = parseInt(parts, 4, 24);
         activeCommand.runMinePredictedFromChat(parts[2], radius, targets);
